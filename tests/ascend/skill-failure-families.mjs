@@ -422,7 +422,7 @@ test('exhausted native retries reopen the same question with the draft and settl
  });
  assert.equal(output.status,'ready');
  assert.equal(providerFaults,2);
- assert.equal(provider.requests(),5);
+ assert.equal(provider.requests(),4);
  assert.deepEqual(backoffs,[1000]);
  assert.equal(checks.length,2,'unchanged rejected submission must not rerun an already settled checker');
  assert.notEqual(checks[0],checks[1]);

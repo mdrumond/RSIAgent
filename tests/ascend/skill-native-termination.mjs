@@ -17,6 +17,7 @@ async function fixture(t,script){
   if(res.writableEnded||next===undefined)return;
   if(next.status){res.writeHead(next.status,{'content-type':'application/json'});res.end(JSON.stringify({error:{message:next.error,type:'permission_error'}}));return;}
   res.writeHead(200,{'content-type':'text/event-stream'});const tool=next.result!==undefined||next.tool,delta=tool?{role:'assistant',tool_calls:[{index:0,id:'call'+bodies.length,type:'function',function:{name:next.tool??'submit_review',arguments:JSON.stringify(next.tool?next.args:{result:next.result})}}]}:{role:'assistant',content:'Finished without submitting'};
+  if(next.readAlongside)delta.tool_calls.push({index:1,id:'read-alongside',type:'function',function:{name:'read',arguments:JSON.stringify({path:'input.json'})}});
   res.end('data: '+JSON.stringify({id:'test',object:'chat.completion.chunk',created:1,model:'termination',choices:[{index:0,delta,finish_reason:tool?'tool_calls':'stop'}]})+'\n\ndata: [DONE]\n\n');
  });server.listen(0,'127.0.0.1');await once(server,'listening');t.after(async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));});
  const env='QA_TERMINATION_FIXTURE';const previous=process.env[env];process.env[env]='fixture';t.after(()=>{if(previous===undefined)delete process.env[env];else process.env[env]=previous;});
@@ -30,11 +31,11 @@ test('actual Pi SDK returns validation feedback, accepts selector issue fields, 
   return {};
  });
  const input={...f,groups:[],entries:[],proposal:{changes:[],memoryRefs:[]},answers:{},sourceCatalogue:{directory:f.directory,indexFile:join(f.directory,'unused.json'),records:f.proofRecords,facts:[],pages:[],sources:[]},evidenceSummary:{items:[{id:'summary-item',text:'Observed failure',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]}]}};
- const result=await nativeQaReview(input);assert.equal(result.value.verdict,'revise');assert.equal(result.value.issues[0].summaryItemId,'summary-item');assert.equal(f.bodies.length,3);assert.equal(result.value.claims[1].proofs[0].quote,'Observed failure');
- const cached=await nativeQaReview({...input,config:{}});assert.equal(cached.recovered,true);assert.equal(f.bodies.length,3);assert.deepEqual(cached.value,result.value);assert.equal(cached.session,result.session);await rm(join(f.directory,'native-session.json'));const withoutSession=await nativeQaReview({...input,config:{}});assert.equal(withoutSession.recovered,true);assert.equal(withoutSession.session,undefined);assert.equal(f.bodies.length,3);
+ const result=await nativeQaReview(input);assert.equal(result.value.verdict,'revise');assert.equal(result.value.issues[0].summaryItemId,'summary-item');assert.equal(f.bodies.length,2);assert.equal(result.value.claims[1].proofs[0].quote,'Observed failure');
+ const cached=await nativeQaReview({...input,config:{}});assert.equal(cached.recovered,true);assert.equal(f.bodies.length,2);assert.deepEqual(cached.value,result.value);assert.equal(cached.session,result.session);await rm(join(f.directory,'native-session.json'));const withoutSession=await nativeQaReview({...input,config:{}});assert.equal(withoutSession.recovered,true);assert.equal(withoutSession.session,undefined);assert.equal(f.bodies.length,2);
  const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.kind,'submitted');assert.equal(termination.rejectedSubmissions,1);
  const legacy={...result.value,issues:[{problem:'Observed failure',reference:'raw',quote:'Observed failure'}]};await writeFile(join(f.directory,'submission.json'),JSON.stringify(legacy));
- const historical=await nativeQaReview({...input,config:{}});assert.equal(historical.recovered,true);assert.equal(historical.value.issues[0].reference,'raw');assert.equal(historical.value.issues[0].sourceSha256.length,64);assert.equal(f.bodies.length,3);
+ const historical=await nativeQaReview({...input,config:{}});assert.equal(historical.recovered,true);assert.equal(historical.value.issues[0].reference,'raw');assert.equal(historical.value.issues[0].sourceSha256.length,64);assert.equal(f.bodies.length,2);
 });
 test('actual Pi SDK preserves sanitized proxy403 separately from no-submit',async t=>{
  const f=await fixture(t,()=>({status:403,error:'Proxy denied Bearer secret-token https://proxy.invalid/path?token=private'}));
@@ -56,7 +57,7 @@ test('actual Pi SDK cancellation drains HTTP work and preserves the proposal ela
  const running=runProposalQa({...input,signal:stop.signal},{now:()=>clock,qaAnswer:args=>reviewSession({...f,directory:args.directory,signal:args.signal,seconds:args.seconds}).then(()=>{throw Error('Unexpected submission');})});
  await arrived;clock=40000;stop.abort(Error('Pause native QA'));await assert.rejects(running,/Pause native QA/);
  resume=true;const out=await runProposalQa(input,{now:()=>clock,qaAnswer:async({seconds,directory,signal})=>{assert.equal(seconds,260);await reviewSession({...f,directory,signal,seconds});return {answers:Object.fromEntries(qaTopics.map(k=>[k,{text:'Supported '+k,refs:[]}]))};},qaReview:async()=>({verdict:'approved',reason:'Checked'})});
- assert.equal(out.elapsedSeconds,40);assert.equal(out.verdict,'approved');assert.equal(f.bodies.length,3);
+ assert.equal(out.elapsedSeconds,40);assert.equal(out.verdict,'approved');assert.equal(f.bodies.length,2);
 });
 
 test('actual Pi SDK elapsed termination is distinct from cancellation and no-submit',async t=>{
@@ -90,11 +91,11 @@ test('actual Pi native draft write and edit leave evidence and session files rea
 
 test('actual Pi accepts supported submission without reading every supplied diagnostic',async t=>{
  const f=await fixture(t,n=>n===1?{result:valid()}:{}),group={id:'diagnostics',occurrences:Array.from({length:8},(_,i)=>({reference:'events:'+i,data:{message:'Distinct failure '+i},artifacts:[]})),linkedDiagnostics:[{reference:'events:linked',data:{message:'Linked failure'},artifacts:[]}]};
- const result=await reviewSession({...f,evidenceGroups:[group]});assert.equal(result.value.reason,'Observed failure');assert.equal(f.bodies.length,2);const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.rejectedSubmissions,0);
+ const result=await reviewSession({...f,evidenceGroups:[group]});assert.equal(result.value.reason,'Observed failure');assert.equal(f.bodies.length,1);const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.rejectedSubmissions,0);
 });
 test('actual Pi still requires explicit audit reads before accepting supported submission',async t=>{
  let required;const f=await fixture(t,n=>n===1||n===3?{result:valid()}:n===2?{tool:'read',args:{path:required}}:{});required=join(f.directory,'primary.txt');await writeFile(required,'Observed failure\n');
- const result=await reviewSession({...f,requiredReads:[required]});assert.equal(result.value.reason,'Observed failure');assert.equal(f.bodies.length,4);const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.rejectedSubmissions,1);
+ const result=await reviewSession({...f,requiredReads:[required]});assert.equal(result.value.reason,'Observed failure');assert.equal(f.bodies.length,3);const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.rejectedSubmissions,1);
 });
 
 test('actual Pi continues a family draft after a normal stop in the same session',async t=>{
@@ -108,7 +109,7 @@ test('actual Pi continues a family draft after a normal stop in the same session
  const result=await reviewSession({...f,writableDirectory:draft,continueFamilyDraft:true});
  assert.equal(result.value.reason,'Observed failure');
  assert.equal(await readFile(join(draft,'kernel.py'),'utf8'),'VALUE=1\n');
- assert.equal(f.bodies.length,4);
+ assert.equal(f.bodies.length,3);
  assert(f.bodies[2].messages.some(message=>message.role==='tool'));
  assert(f.bodies[2].messages.some(message=>message.role==='assistant'&&message.content==='Finished without submitting'));
 });
@@ -141,8 +142,8 @@ test('Pi retries a provider timeout and does not mistake a later no-submit for a
  assert.equal(f.bodies.length,1);
 });
 
-test('Pi retains a validated submission when the following request exhausts native retries',async t=>{
- const f=await fixture(t,n=>{assert.equal(n,1);return {result:valid()};});
+test('Pi ends a mixed tool turn on accepted submission before another provider request',async t=>{
+ const f=await fixture(t,n=>{assert.equal(n,1);return {result:valid(),readAlongside:true};});
  let validations=0,requests=0;
  const input={...f,validate:value=>{validations++;return value;}};
  const out=await reviewSession(input,{
@@ -150,10 +151,10 @@ test('Pi retains a validated submission when the following request exhausts nati
  });
  assert.equal(out.value.reason,valid().reason);
  assert.equal(validations,1);
- assert.equal(requests,3);
+ assert.equal(requests,1);
  assert.equal(f.bodies.length,1);
  const terminal=JSON.parse(await readFile(join(f.directory,'termination.json'),'utf8'));
  assert.equal(terminal.kind,'submitted');
- assert.equal(terminal.providerErrors,2);
- assert.equal(terminal.nativeRetries,1);
+ assert.equal(terminal.providerErrors,0);
+ assert.equal(terminal.nativeRetries,0);
 });

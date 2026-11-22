@@ -168,7 +168,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
     const accepted=await check(result);
     await writeFile(join(directory,'submission.json'),JSON.stringify(accepted,null,2));
     submitted=accepted;
-    return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};
+    return {content:[{type:'text',text:'Accepted.'}],details:{}};
    }catch(error){await recordRejection(id,error.message,result);throw error;}
    finally{submitting=false;}
   }});};
@@ -179,6 +179,12 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await skillModelFromProfile(config.skill_writer_actor??config.actor,{directory}),thinkingLevel:'off',
   tools:['read','grep','find','ls',...(writableDirectory?['write','edit']:[]),'submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
+ // End at Pi's completed-turn boundary, including a submission batched with reads.
+ const finishTurn=session.agent.finishTurn;
+ session.agent.finishTurn=async(turn,signal)=>{
+  const decision=await finishTurn?.(turn,signal);
+  return submitted===undefined?decision:{action:'end'};
+ };
  if(wrapStream)session.agent.streamFunction=wrapStream(session.agent.streamFunction);
  let turnStarted,responseStarted,retryStarted,latestProviderError,retryError;
  let providerErrors=0,nativeRetries=0;

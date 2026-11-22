@@ -88,7 +88,7 @@ test('native Pi submission accepts selector-only prose and preserves reviewed gu
  // Real Pi/proof/submission contract, with synthetic retrieved memory and no live KDB/provider.
  const retrievals=[{entries:[{collection:'memory',chunk_id:'chunk',text:'Successful bounded formulation'}]}];
  f.deps.session=async args=>{const reviewed=await reviewSession({...args,knowledge:false,config:{...args.config,actor:provider.profile,skill_writer_actor:provider.profile},validate:value=>args.validate(value,retrievals)});return {...reviewed,retrievals};};
- const rows=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);assert.equal(rows.length,3);assert.equal(submitted,3);assert.equal(provider.requests(),9);for(const row of rows)assert.equal(row.text,(await skillInput(join(f.root,'skills/versions',row.version))).text);
+ const rows=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);assert.equal(rows.length,3);assert.equal(submitted,3);assert.equal(provider.requests(),6);for(const row of rows)assert.equal(row.text,(await skillInput(join(f.root,'skills/versions',row.version))).text);
 });
 test('the native design writer cites verified campaign evidence alongside retained baselines',async t=>{
  const f=await fixture(t),valid=join(f.root,'valid.log'),changed=join(f.root,'changed.log');
@@ -123,7 +123,7 @@ test('the native design writer cites verified campaign evidence alongside retain
  };
  const candidates=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);
  assert.equal(candidates.length,3);
- assert.equal(provider.requests(),12);
+ assert.equal(provider.requests(),9);
  for(const directory of directories){
   const native=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
   const refs=new Set(native.proofSelectors.map(record=>record.reference));

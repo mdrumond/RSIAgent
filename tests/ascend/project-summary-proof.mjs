@@ -73,16 +73,16 @@ test('native classification gets complete facts inline and repairs rejected proo
  const value={cause:'unknown',reason:'One passing verification exists',coverage:'unknown',guidanceIds:[],evidenceRefs:['failure:1'],gap:'unknown',claims:[{path:'reason',kind:'observation',proofs:[{reference:fact.reference}]}]};
  const p=await provider(t,(n,body)=>{if(n===0)return ['read',{path:'input.json'}];if(n===1)return ['submit_review',{result:{...value,claims:[{...value.claims[0],proofs:[{...value.claims[0].proofs[0],value:0}]}]}}];if(n===2){return ['submit_review',{result:value}];}});
  const directory=join(f.root,'review'),input={directory,config:{root:f.root,actor:p.profile},group:{id:'failure',occurrences:[{reference:'failure:1',projectId:'p',attemptId:f.attempt.id,message:'failed attempt'}]},entries:[],seconds:15,validate:r=>r};
- const out=await nativeClassify(input);assert.equal(out.value.reason,value.reason);assert.equal(p.requests(),4);
+ const out=await nativeClassify(input);assert.equal(out.value.reason,value.reason);assert.equal(p.requests(),3);
  const context=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));assert.equal(context.projectSummaries[0].projectStatus,'failed');assert.equal(context.proofEvidence.find(x=>x.factId===fact.factId).value,1);
  const session=JSON.parse(await readFile(join(directory,'native-session.json'),'utf8'));const rows=(await readFile(session.path,'utf8')).split('\n').filter(Boolean).map(JSON.parse);assert.equal(rows.filter(x=>x.type==='session').length,1);
- await nativeClassify(input);assert.equal(p.requests(),4);
+ await nativeClassify(input);assert.equal(p.requests(),3);
 });
 test('cached legacy submission is rejected and repaired rather than bypassing proof mode',async t=>{
  const f=await fixture(t),directory=join(f.root,'legacy');await mkdir(directory);await writeFile(join(directory,'submission.json'),JSON.stringify({reason:'old uncited'}));
  const record={reference:'r',text:'observed'},value={reason:'observed',claims:[{path:'reason',text:'observed',kind:'observation',proofs:[{reference:'r',quote:'observed'}]}]};
  const p=await provider(t,n=>n===0?['submit_review',{result:value}]:undefined);
- const out=await reviewSession({directory,config:{actor:p.profile},prompt:{entries:[{id:'r',text:'observed'}]},seconds:10,proofRequired:true,validate:x=>x});assert.equal(out.value.reason,'observed');assert.equal(p.requests(),2);const [archived]=await readdir(join(directory,'contract-history'));assert.equal(JSON.parse(await readFile(join(directory,'contract-history',archived,'submission.json'),'utf8')).reason,'old uncited');
+ const out=await reviewSession({directory,config:{actor:p.profile},prompt:{entries:[{id:'r',text:'observed'}]},seconds:10,proofRequired:true,validate:x=>x});assert.equal(out.value.reason,'observed');assert.equal(p.requests(),1);const [archived]=await readdir(join(directory,'contract-history'));assert.equal(JSON.parse(await readFile(join(directory,'contract-history',archived,'submission.json'),'utf8')).reason,'old uncited');
 });
 test('legacy approved QA cannot bypass proof-required answer and semantic re-review',async t=>{
  const f=await fixture(t),directory=join(f.root,'qa');await mkdir(directory);const proposal={changes:[],memoryRefs:[]},input={directory,proposal,entries:[],groups:[],target:'a3',validateProposal:x=>x};
@@ -135,10 +135,10 @@ test('changed project facts use fresh native QA sessions even when old proof sti
  const f=await fixture(t),directory=join(f.root,'qa-native-facts'),text='Read supplied facts',baseline={id:'baseline',text};let requests=0;
  const answers=Object.fromEntries(['action','mechanism','example','evidence','objective'].map(k=>[k,{text,refs:['project:p:passingVerificationCount']}]));
  const answer={answers,claims:Object.keys(answers).map(k=>({path:'answers.'+k+'.text',text,kind:'hypothesis',proofs:[{reference:'baseline',quote:text}]}))},review={verdict:'approved',reason:text,claims:[{path:'reason',text,kind:'hypothesis',proofs:[{reference:'baseline',quote:text}]}]};
- const p=await provider(t,n=>{requests++;const turn=n%6;return turn===0||turn===3?['read',{path:'input.json'}]:turn===1?['submit_review',{result:answer}]:turn===4?['submit_review',{result:review}]:undefined;});
+ const p=await provider(t,n=>{requests++;const turn=n%4;return turn===0||turn===2?['read',{path:'input.json'}]:turn===1?['submit_review',{result:answer}]:turn===3?['submit_review',{result:review}]:undefined;});
  const input={directory,config:{root:f.root,actor:p.profile},proposal:{changes:[],memoryRefs:[]},entries:[baseline],groups:[{id:'g',occurrences:[{reference:'failure:1',projectId:'p',message:'Observed failure'}]}],target:'a3',validateProposal:x=>x};
- const a=await runProposalQa(input,{qaAnswer:async args=>(await nativeQaAnswer(args)).value,qaReview:async args=>(await nativeQaReview(args)).value});assert.equal(a.verdict,'approved');assert.equal(requests,6);
- f.state.event(f.attempt.id,'verification',{passed:true});const b=await runProposalQa(input,{qaAnswer:async args=>(await nativeQaAnswer(args)).value,qaReview:async args=>(await nativeQaReview(args)).value});assert.equal(b.verdict,'approved');assert.equal(requests,12);assert.notEqual(a.projectFactsIdentity,b.projectFactsIdentity);assert.ok(b.elapsedSeconds>=a.elapsedSeconds);
+ const a=await runProposalQa(input,{qaAnswer:async args=>(await nativeQaAnswer(args)).value,qaReview:async args=>(await nativeQaReview(args)).value});assert.equal(a.verdict,'approved');assert.equal(requests,4);
+ f.state.event(f.attempt.id,'verification',{passed:true});const b=await runProposalQa(input,{qaAnswer:async args=>(await nativeQaAnswer(args)).value,qaReview:async args=>(await nativeQaReview(args)).value});assert.equal(b.verdict,'approved');assert.equal(requests,8);assert.notEqual(a.projectFactsIdentity,b.projectFactsIdentity);assert.ok(b.elapsedSeconds>=a.elapsedSeconds);
 });
 
 test('typed native QA schema returns misplaced claims for correction in the same session',async t=>{
@@ -147,7 +147,7 @@ test('typed native QA schema returns misplaced claims for correction in the same
  const valid={verdict:'revise',reason,issues:[{problem}],claims:[claim('reason',reason),claim('issues.0.problem',problem)]};
  const p=await provider(t,(n,body)=>{if(n===0)return['submit_review',{result:{verdict:'revise',reason,issues:[{problem,claims:valid.claims}]}}];if(n===1){assert.ok(JSON.stringify(body.messages.filter(m=>m.role==='tool')).includes('claims'));return['submit_review',{result:{...valid,reasonClaims:valid.claims}}];}if(n===2)return['submit_review',{result:valid}];});
  const out=await nativeQaReview({directory,config:{actor:p.profile},seconds:15,proposal:{changes:[],memoryRefs:[]},entries:[{id:'baseline',text}],groups:[],answers:{},validate:x=>x});
- assert.equal(out.value.verdict,'revise');assert.equal(p.requests(),4);const session=JSON.parse(await readFile(join(directory,'native-session.json'),'utf8'));const rows=(await readFile(session.path,'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rows.filter(x=>x.type==='session').length,1);
+ assert.equal(out.value.verdict,'revise');assert.equal(p.requests(),3);const session=JSON.parse(await readFile(join(directory,'native-session.json'),'utf8'));const rows=(await readFile(session.path,'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rows.filter(x=>x.type==='session').length,1);
 });
 
 test('relocated snapshot performance logs supply facts without falling back to old live paths',async t=>{

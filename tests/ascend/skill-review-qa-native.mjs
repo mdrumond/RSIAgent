@@ -164,7 +164,7 @@ test('failure-first native answer and review derive quotes from verified artifac
   qaReview:async args=>{reviewing=args.directory;return (await nativeQaReview(args)).value;},
  });
  assert.equal(report.verdict,'approved');
- assert.equal(provider.requests(),6);
+ assert.equal(provider.requests(),4);
  for(const directory of [answering,reviewing]){
   const nativeInput=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
   assert(nativeInput.frozenEvidence.artifacts.some(artifact=>artifact.id===proof.reference&&artifact.text===text));
@@ -193,7 +193,7 @@ test('failure-first native QA revalidates a legacy cached literal proof in place
   assert.equal(resumed.session,cached.session);
   assert.deepEqual(resumed.value,cached.value);
  }
- assert.equal(provider.requests(),4);
+ assert.equal(provider.requests(),2);
 });
 
 test('failure-first native QA repairs an answer in fresh sessions and keeps the approved draft',async t=>{
@@ -255,7 +255,7 @@ test('failure-first native QA repairs an answer in fresh sessions and keeps the 
  assert.equal(new Set(reviewDirectories).size,2);
  const second=JSON.parse(await readFile(join(answerDirectories[1],'termination.json'),'utf8'));
  assert.equal(second.rejectedSubmissions,1);
- assert.equal(provider.requests(),9);
+ assert.equal(provider.requests(),5);
 });
 
 test('five isolated native reviewers decide from frozen answers and a primary-source audit',async t=>{
@@ -285,7 +285,7 @@ test('five isolated native reviewers decide from frozen answers and a primary-so
  });
  assert.equal(out.verdict,'approved',out.error?.message??out.reason);
  const panel=out.rounds[0].panel;
- assert.equal(panel.decision.approvals,4);assert.equal(stages.size,5);assert.equal(provider.requests(),12);
+ assert.equal(panel.decision.approvals,4);assert.equal(stages.size,5);assert.equal(provider.requests(),6);
  assert.equal(panel.decision.claims[0].audit.proofs[0].quote,extra.text);
  for(const directory of stages){
   const seen=JSON.parse(await readFile(join(directory,'input.json')));
