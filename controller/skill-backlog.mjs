@@ -153,6 +153,13 @@ export class SkillBacklog {
  }
  failures({dirty=true,limit=100,offset=0,occurrenceLimit=20,includeRetired=false}={}){return this.db.prepare(`SELECT id FROM skill_backlog_failures f WHERE ${dirty?'dirty=1':'1'} AND ${includeRetired?'1':analysisScopeSql(this.db)} ${includeRetired?'':`AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`} ORDER BY fresh DESC,updated DESC,rowid LIMIT ? OFFSET ?`).all(limit,offset).map(r=>this.failure(r.id,{limit:occurrenceLimit,includeRetired}));}
  acknowledge(id,{classification,count}={}){return this.atomic(()=>{const group=this.failure(id,{limit:0});if(!group)return;const data=this.db.prepare('SELECT data FROM skill_backlog_failures WHERE id=?').get(id);this.db.prepare('UPDATE skill_backlog_failures SET data=?,dirty=?,fresh=CASE WHEN ? THEN fresh ELSE 0 END WHERE id=?').run(JSON.stringify({...parse(data.data),...(classification?{classification}:{})}),Number(count!==undefined&&count<group.count),Number(count!==undefined&&count<group.count),id);});}
+ reclassifyVerifierExits(revision){
+  this.db.prepare(`UPDATE skill_backlog_failures SET dirty=1,fresh=1 WHERE id IN (
+   SELECT c.key FROM skill_backlog_items i, json_each(i.data,'$.preparation.classifications') c
+   WHERE i.status='deferred' AND json_extract(i.data,'$.workflow')='failure-first-v1'
+   AND json_extract(i.data,'$.preparation.failureRoutingRevision') IS NOT ?
+   AND json_extract(c.value,'$.triage.observed.kind')='verifier-exit' AND ${activeItemSql(this.db,'i')})`).run(revision);
+ }
  reclassify(id){this.db.prepare('UPDATE skill_backlog_failures SET dirty=1,fresh=1 WHERE id=?').run(id);}
  get(id){const epoch=this.meta('queue-epoch'),key=epoch&&!id.startsWith('epoch:')?'epoch:'+epoch+':'+id:id;const row=this.db.prepare('SELECT data FROM skill_backlog_items WHERE id=? OR key=? OR id=(SELECT item_id FROM skill_backlog_aliases WHERE key=?)').get(id,key,key);return row?parse(row.data):null;}
  list({status,limit=100,includeRetired=false,workflow,objective}={}){

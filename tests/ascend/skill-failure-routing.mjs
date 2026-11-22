@@ -8,7 +8,7 @@ import {State} from '../../controller/state.mjs';
 import {claimLearningRequest} from '../../controller/skill-review.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {analyzeBacklog} from '../../cli/skill-backlog-analysis.mjs';
-import {runCampaignFailureStep} from '../../cli/skill-failure-campaign.mjs';
+import {failureCampaignStatus,runCampaignFailureStep} from '../../cli/skill-failure-campaign.mjs';
 
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'skill-routing-'));
@@ -203,17 +203,33 @@ test('a complete coverage report opens baseline screening only for measured kern
  }
 });
 
-test('a previously deferred verifier exit is reconsidered once after the routing upgrade',async t=>{
+test('an upgrade wakes a previously deferred coverage failure for exactly one new family',async t=>{
  const f=await fixture(t),attempt=f.start('legacy');
- await f.verify(attempt,'legacy.log','unresolved verifier error');
+ const report={mode:'coverage',passed:false,kernel:'kernel.py',cases:[{sql:{kernel_path:true,needed:24576,contrib_covered:384}}]};
+ await f.verify(attempt,'legacy.log',JSON.stringify(report,null,2));
  f.backlog.ingest();
- const {items:[old]}=await f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness'})));
- f.backlog.revise(old.id,{preparation:{...old.preparation,failureRoutingRevision:'legacy'},status:'deferred'});
+ const [group]=f.backlog.failures(),observed={kind:'verifier-exit',reference:group.occurrences[0].reference};
+ const old={...classification(group).classifications[0],triage:{route:'unresolved',observed}};
+ f.backlog.upsert({key:'failure-first:'+group.id,workflow:'failure-first-v1',objective:'unknown',status:'deferred',
+  groupIds:[group.id],priority:1,base:'base',preparation:{failureRoutingRevision:'legacy',classifications:{[group.id]:old}}});
+ f.backlog.acknowledge(group.id,{classification:old,count:group.count});
+ assert.equal(f.backlog.status().dirtyFailures,0);
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,true);
+ let classifications=0,families=0;
  const step=()=>runCampaignFailureStep(f.config,{slots:[0,1,2,3],remainingSeconds:100,memory:{}},{
-  analyze:()=>f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness'}))),
-  family:()=>assert.fail('Generic verifier exit')});
+  analyze:()=>f.analyze(({groups:[current],validate})=>{
+   classifications++;return validate(classification(current,{bucket:'correctness'}));
+  }),
+  input:async()=>({text:'base',sha256:'base'}),model:async()=>({id:'model'}),
+  family:async()=>{families++;return {status:'needs-evidence',reason:'No retained source fixture'};}
+ });
+ await step();
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,false);
  assert.equal((await step()).status,'idle');
- assert.equal(f.backlog.get(old.id).preparation.failureRoutingRevision,old.preparation.failureRoutingRevision);
- assert.equal((await step()).status,'idle');
- assert.equal(f.backlog.failures().length,0);
+ assert.deepEqual([classifications,families],[1,1]);
+});
+
+test('an empty campaign stays idle across the admission upgrade',async t=>{
+ const f=await fixture(t);
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,false);
 });

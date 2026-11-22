@@ -24,16 +24,16 @@ const open=config=>{const state=new State(join(config.root,'state.sqlite'));retu
 const value=(db,key)=>table(db,'control')?JSON.parse(db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
 const table=(db,name)=>!!db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name);
 const queuedFamily=backlog=>backlog.list({status:'queued',workflow:'failure-first-v1',objective:'correctness',limit:1})[0];
+function reconsiderVerifierExits(backlog){
+ if(backlog.meta('failure-first-reclassification')===failureRoutingRevision)return;
+ backlog.atomic(()=>{
+  if(backlog.meta('failure-first-reclassification')===failureRoutingRevision)return;
+  backlog.reclassifyVerifierExits(failureRoutingRevision);
+  backlog.meta('failure-first-reclassification',failureRoutingRevision);
+ });
+}
 function requeueUnwitnessedFamilies(backlog){
  backlog.atomic(()=>{
-  if(backlog.meta('failure-first-reclassification')!==failureRoutingRevision){
-   for(const item of backlog.list({status:'deferred',workflow:'failure-first-v1',limit:-1})){
-    if(item.preparation?.failureRoutingRevision===failureRoutingRevision)continue;
-    for(const [id,c] of Object.entries(item.preparation?.classifications??{}))
-     if(c.triage?.observed?.kind==='verifier-exit')backlog.reclassify(id);
-   }
-   backlog.meta('failure-first-reclassification',failureRoutingRevision);
-  }
   const queued=backlog.list({status:'queued',workflow:'failure-first-v1',objective:'correctness',limit:100});
   for(const item of queued){
    const classifications=item.preparation?.classifications;
@@ -57,6 +57,7 @@ export function failureMemoryGeneration(config,state){
 export async function failureCampaignStatus(config){
  const {state,backlog}=open(config);
  try{
+  reconsiderVerifierExits(backlog);
   const active=backlog.meta('failure-first-current'),run=active&&backlog.run(active),cp=run?.checkpoint;
   const pilot=cp&&await optional(join(cp.directory,'pilot','pilot.json'));
   const isolation=cp?.phase==='isolate'&&await optional(join(cp.directory,'family','isolation.json'));
@@ -69,7 +70,7 @@ export async function failureCampaignStatus(config){
    ...(isolation?{isolation:{elapsedSeconds:isolation.elapsedSeconds,allocatedSeconds:failureTiming.isolationSeconds,timings:isolation.timings}}:{}),
    screen:{completed:screen.length,passed:screen.filter(r=>r.correct===true).length,matchingFailures:screen.filter(r=>r.correct===false&&r.mechanismMatch).length},
    resources:cp?.slots??value(state.db,'skill-background-resources')??[],pending:!!run,unresolved:!!cp?.unresolved,
-   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.meta('failure-first-reclassification')!==failureRoutingRevision||backlog.status().dirtyFailures>0||!!queuedFamily(backlog))};
+   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.status().dirtyFailures>0||!!queuedFamily(backlog))};
  }finally{state.close();}
 }
 
@@ -103,7 +104,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
  try{
   let ingestion;const until=now()+1000;do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&now()<until);
   const existing=backlog.list({status:'running',limit:1})[0];
-  if(!existing)requeueUnwitnessedFamilies(backlog);
+  if(!existing){reconsiderVerifierExits(backlog);requeueUnwitnessedFamilies(backlog);}
   if(!existing&&!queuedFamily(backlog)){
    await ops.analyze({config,backlog,directory:join(config.root,'skills','priority','failure-first-analysis',hash(backlog.meta('queue-epoch'))),
     classificationOnly:true,seconds:120,remainingSeconds:Math.min(120,campaignLeft()),limit:2,signal});
