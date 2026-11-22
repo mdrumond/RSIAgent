@@ -554,11 +554,14 @@ test('QA repairs a changed review flag while retaining its substantive revision'
  const f=await fixture(t);let repairs=0;
  f.deps.qa=async input=>{
   const proposal=structuredClone(input.proposal),change=proposal.changes[0];
-  change.text+=' Include one independent check.';change.negative=true;
+  change.text+=' Include one independent check.';change.negative=true;change.id='replacement-id';
   try{input.validateProposal(proposal);assert.fail('Changed flag accepted');}catch(error){
-   const field=/changes\[0\]\.(\w+) must be (false|true); received (false|true)/.exec(error.message);
-   assert(field,error.message);assert.equal(JSON.parse(field[3]),change[field[1]]);
-   change[field[1]]=JSON.parse(field[2]);repairs++;
+   const fields=[...error.message.matchAll(/changes\[0\]\.(\w+) must be ("[^"]*"|false|true); received ("[^"]*"|false|true)/g)];
+   assert.deepEqual(fields.map(match=>match[1]).sort(),['id','negative']);
+   for(const [,key,expected,actual] of fields){
+    assert.equal(JSON.parse(actual),change[key]);change[key]=JSON.parse(expected);
+   }
+   repairs++;
   }
   return {verdict:'approved',approval:'reviewed',proposal:input.validateProposal(proposal)};
  };
