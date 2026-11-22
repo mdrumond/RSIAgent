@@ -76,9 +76,10 @@ export async function freezeGroups(root,groups,directory){
     const copied=join(directory,'evidence',hash([observation.reference,path])+'.log');await writeFile(copied,bytes);
     copies.push({path:copied,sha256:createHash('sha256').update(bytes).digest('hex'),originalBytes:info.size,...(original===verified?.evidence?{primaryVerification:true}:{}),truncated:info.size>bytes.length,layout:info.size>bytes.length?'head-and-tail':'complete'});
     if(original===verified?.evidence){
-     const last=bytes.toString('utf8').trimEnd().split('\n').at(-1);
+     const output=bytes.toString('utf8').trimEnd();
+     const last=output.slice(output.lastIndexOf('\n')+1);
      try{
-      const verdict=JSON.parse(last);
+      const verdict=JSON.parse(info.size===bytes.length&&output.trimStart().startsWith('{')&&last.trim()==='}'?output:last);
       const kind=verifierBoundaryKind(verdict);
       if(kind)observation.verifiedBoundaryKind=kind;
      }catch(error){if(!(error instanceof SyntaxError))throw error;}

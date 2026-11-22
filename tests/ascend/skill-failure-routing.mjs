@@ -190,3 +190,30 @@ test('numerical evidence still queues baseline isolation when a declaration also
  assert.equal(item.preparation.classifications[item.groupIds[0]].triage.route,'baseline');
  assert.equal(item.status,'queued');
 });
+
+test('a complete coverage report opens baseline screening only for measured kernel-path undercoverage',async t=>{
+ for(const [kernel_path,contrib_covered,expected] of [[true,384,'baseline'],[false,384,'unresolved'],[true,24576,'unresolved']]){
+  const f=await fixture(t),attempt=f.start('coverage');
+  const report={mode:'coverage',passed:false,kernel:'kernel.py',cases:[{case:'corr-6',sql:{needed:24576,contrib_covered,kernel_path}}]};
+  await f.verify(attempt,'coverage.log',JSON.stringify(report,null,2));
+  f.backlog.ingest();
+  const {items:[item]}=await f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness'})));
+  assert.equal(item.preparation.classifications[item.groupIds[0]].triage.route,expected);
+  assert.equal(item.status,expected==='baseline'?'queued':'deferred');
+ }
+});
+
+test('a previously deferred verifier exit is reconsidered once after the routing upgrade',async t=>{
+ const f=await fixture(t),attempt=f.start('legacy');
+ await f.verify(attempt,'legacy.log','unresolved verifier error');
+ f.backlog.ingest();
+ const {items:[old]}=await f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness'})));
+ f.backlog.revise(old.id,{preparation:{...old.preparation,failureRoutingRevision:'legacy'},status:'deferred'});
+ const step=()=>runCampaignFailureStep(f.config,{slots:[0,1,2,3],remainingSeconds:100,memory:{}},{
+  analyze:()=>f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness'}))),
+  family:()=>assert.fail('Generic verifier exit')});
+ assert.equal((await step()).status,'idle');
+ assert.equal(f.backlog.get(old.id).preparation.failureRoutingRevision,old.preparation.failureRoutingRevision);
+ assert.equal((await step()).status,'idle');
+ assert.equal(f.backlog.failures().length,0);
+});

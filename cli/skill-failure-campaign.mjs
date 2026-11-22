@@ -26,6 +26,14 @@ const table=(db,name)=>!!db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").
 const queuedFamily=backlog=>backlog.list({status:'queued',workflow:'failure-first-v1',objective:'correctness',limit:1})[0];
 function requeueUnwitnessedFamilies(backlog){
  backlog.atomic(()=>{
+  if(backlog.meta('failure-first-reclassification')!==failureRoutingRevision){
+   for(const item of backlog.list({status:'deferred',workflow:'failure-first-v1',limit:-1})){
+    if(item.preparation?.failureRoutingRevision===failureRoutingRevision)continue;
+    for(const [id,c] of Object.entries(item.preparation?.classifications??{}))
+     if(c.triage?.observed?.kind==='verifier-exit')backlog.reclassify(id);
+   }
+   backlog.meta('failure-first-reclassification',failureRoutingRevision);
+  }
   const queued=backlog.list({status:'queued',workflow:'failure-first-v1',objective:'correctness',limit:100});
   for(const item of queued){
    const classifications=item.preparation?.classifications;
@@ -61,7 +69,7 @@ export async function failureCampaignStatus(config){
    ...(isolation?{isolation:{elapsedSeconds:isolation.elapsedSeconds,allocatedSeconds:failureTiming.isolationSeconds,timings:isolation.timings}}:{}),
    screen:{completed:screen.length,passed:screen.filter(r=>r.correct===true).length,matchingFailures:screen.filter(r=>r.correct===false&&r.mechanismMatch).length},
    resources:cp?.slots??value(state.db,'skill-background-resources')??[],pending:!!run,unresolved:!!cp?.unresolved,
-   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.status().dirtyFailures>0||!!queuedFamily(backlog))};
+   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.meta('failure-first-reclassification')!==failureRoutingRevision||backlog.status().dirtyFailures>0||!!queuedFamily(backlog))};
  }finally{state.close();}
 }
 

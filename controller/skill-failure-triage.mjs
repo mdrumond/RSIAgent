@@ -1,4 +1,4 @@
-export const failureRoutingRevision='evidence-routing-v2';
+export const failureRoutingRevision='evidence-routing-v3';
 
 const infrastructureExits=new Set([124,125,126,127]);
 const executed=exit=>Number.isInteger(exit)&&exit>=0&&exit<128&&!infrastructureExits.has(exit);
@@ -17,6 +17,13 @@ export function verifierBoundaryKind(receipt){
  if(receipt?.passed===false&&receipt.mode==='verify'&&receipt.flag_value===false&&
    Number.isInteger(receipt.cases)&&receipt.cases>0&&Array.isArray(receipt.failures)&&receipt.failures.length===1&&receipt.failures[0]?.case==='<declaration>')
   return 'declaration-only';
+ // Coverage verifiers measure reachable output elements on the candidate kernel path.
+ if(receipt?.mode==='coverage'&&receipt.passed===false&&typeof receipt.kernel==='string'&&receipt.kernel&&
+    Array.isArray(receipt.cases)&&receipt.cases.some(row=>{
+     const sql=row?.sql;
+     return sql?.kernel_path===true&&Number.isSafeInteger(sql.needed)&&Number.isSafeInteger(sql.contrib_covered)&&
+      sql.contrib_covered>=0&&sql.contrib_covered<sql.needed;
+    }))return 'candidate-verdict';
  return null;
 }
 
