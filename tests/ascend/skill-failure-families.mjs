@@ -471,16 +471,22 @@ test('a retained proposal lets a read-only researcher request the trusted checke
  f.backlog.db.prepare("INSERT INTO skill_backlog_runs(id,item_id,revision,base,seconds,status,snapshot,checkpoint) VALUES(?,?,?,?,?,?,?,?)")
   .run('previous',f.item.id,1,f.item.base,7200,'inconclusive',JSON.stringify(f.item),JSON.stringify({directory:previous}));
  const directory=join(f.root,'new-author');let checks=0;
+ const request={status:'try-retained',familyIdentity:old.identity,reason:'Check the retained controls',claims:missingFamily(f.reference).claims};
+ const provider=await scriptedReview(t,f.root,(body,n)=>{
+  if(n===0)return {name:'submit_review',args:{result:missingFamily(f.reference)}};
+  assert.equal(n,1);assert(body.messages.some(message=>message.role==='tool'&&String(message.content).includes('try-retained')));
+  return {name:'submit_review',args:{result:request}};
+ });
  const result=await prepareFailureFamily({...f,directory,seconds:60,approvedInstruction:{text:'Check the work assigned to each index.'},
   checkReferences:async({family})=>{checks++;assert.equal(family.identity,old.identity);assert.equal(family.transfer.length,2);return {diagnostics:[{variant:'reference',correct:true}]};}},
- {session:async({validate,prompt,resultSchema,allowedPaths})=>{
+ {session:async options=>{
+  const {prompt,resultSchema,allowedPaths}=options;
   const offered=prompt.retainedTest;assert.equal(offered.runId,'previous');assert(allowedPaths.includes(offered.directory));
   const manifest=JSON.parse(await readFile(offered.manifest));assert.deepEqual(JSON.parse(await readFile(offered.editableTemplate)),manifest);
   assert.equal(await readFile(join(offered.directory,manifest.development.checker),'utf8'),f.files['dev/private.py']);
   assert.deepEqual(manifest.development.controls,f.family.development.controls);
-  await assert.rejects(validate(missingFamily(f.reference)),/try-retained/);
-  const request={status:'try-retained',familyIdentity:offered.identity,reason:'Check the retained controls',claims:missingFamily(f.reference).claims};
-  assert(Check(resultSchema,request));return {value:await validate(request)};
+  assert(Check(resultSchema,request));
+  return reviewSession({...options,config:{...options.config,actor:provider.profile},knowledge:false});
  }});
  assert.equal(checks,1);assert.equal(result.status,'ready');assert.equal(result.family.identity,old.identity);
 });
