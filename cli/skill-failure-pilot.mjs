@@ -1,5 +1,6 @@
 /** Isolated failure-first pilot. Adapters own Pi sessions, oracle execution and device custody. */
 import assert from 'node:assert/strict';
+import {setTimeout as delay} from 'node:timers/promises';
 import {mkdir,readFile,writeFile,rename,open,unlink,link,realpath} from 'node:fs/promises';
 import {isAbsolute,join,relative,resolve} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
@@ -15,6 +16,7 @@ const slug=value=>typeof value==='string'&&/^[a-zA-Z0-9_-]+$/.test(value)&&!valu
 const nonempty=value=>typeof value==='string'&&value.trim();
 const positive=value=>Number.isFinite(value)&&value>0;
 const clone=value=>structuredClone(value);
+const trialAttemptDirectory=op=>op.attempts?.length?join(op.directory,'retry-'+op.attempts.length):op.directory;
 const publicFamily=family=>({id:family.id,development:clone(family.development),evidence:clone(family.evidence??[])});
 export function validatePilotManifest(manifest){
  if(!nonempty(manifest?.baseline)||!manifest.identities||!['model','runtime','memory'].every(k=>manifest.identities[k]!==undefined)||!Array.isArray(manifest.families)||!manifest.families.length||manifest.families.length>3)throw Error('Frozen baseline, model/runtime/memory identities and one to three families required');
@@ -97,7 +99,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   if(focused)state.manifestSha256=manifestSha256;
   last=now();
   for(const op of Object.values(state.operations).filter(op=>op.status==='running')){
-   const settled=dependencies.settle&&await dependencies.settle(clone(op));
+   const settled=dependencies.settle&&await dependencies.settle({...clone(op),directory:trialAttemptDirectory(op)});
    if(!settled?.closed)return await result('needs-settlement','Interrupted operation custody remains unresolved',{unresolvedOperation:op.id});
    op.elapsedSeconds+=Math.max(0,wall()-op.runningAt)/1000;
    if(settled.result===undefined)return await result('inconclusive','Settled operation has no recoverable result',{unresolvedOperation:op.id});
@@ -106,13 +108,30 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   }
   delete state.unresolvedOperation;state.status='running';await persist();
   timer=setInterval(()=>{void persist().catch(error=>end.abort(error));if(remaining()<=0)end.abort(Error('Pilot elapsed allocation exhausted'));},1000);
+  const interruptedTrial=op=>op?.kind==='trial'&&op.result?.infrastructure===true&&op.result.correct===null&&(
+   op.result.errorCode==='FAILURE_TRIAL_PROVIDER_TIMEOUT'||/^Native session failed: Request timed out\.?$/i.test(op.result.reason)||
+   (op.result.reason==='Operation elapsed allocation exhausted before result admission'&&op.elapsedSeconds<op.allocatedSeconds));
   const invoke=async(id,kind,input,fn,cap=remaining())=>{
-   const prior=state.operations[id];if(prior?.status==='complete')return clone(prior.result);
+   const prior=state.operations[id];let attempts;
+   if(prior?.status==='complete'){
+    if(!interruptedTrial(prior)||!dependencies.settle)return clone(prior.result);
+    expired();
+    const settled=await dependencies.settle({...clone(prior),directory:trialAttemptDirectory(prior)});
+    if(!settled?.closed)throw Object.assign(Error('Interrupted trial custody remains unresolved'),{code:'PILOT_CUSTODY'});
+    if(settled.result!==undefined&&!settled.result?.infrastructure){
+     prior.result=clone(validatePilotTrial(settled.result,input.task));await persist();return clone(prior.result);
+    }
+    const {attempts:history=[],...previous}=prior;
+    attempts=[...history,{...previous,directory:trialAttemptDirectory(prior)}];
+    const pause=Math.min(60,2**Math.min(attempts.length-1,6));
+    if(remaining()<cap+pause)throw Object.assign(Error('Insufficient elapsed time for interrupted trial recovery'),{code:'PILOT_ADMISSION_BUDGET'});
+    await delay(pause*1000,undefined,{signal:active});
+   }
    expired();if(kind==='trial'&&remaining()<cap)throw Object.assign(Error('Insufficient pilot elapsed time for a full actor and verification allocation'),{code:'PILOT_ADMISSION_BUDGET'});
-   const available=kind==='trial'?cap:Math.min(cap,remaining()),op={id,kind,status:'running',directory:join(directory,'operations',id),allocatedSeconds:available,...(kind==='trial'?{actorSeconds:input.actorSeconds,verificationSeconds:input.verificationSeconds}:{}),elapsedSeconds:0,runningAt:wall()};
-   state.operations[id]=op;working.set(id,{at:now(),prior:0});await mkdir(op.directory,{recursive:true});await persist();
+   const available=kind==='trial'?cap:Math.min(cap,remaining()),op={id,kind,status:'running',...(attempts?{attempts}:{}),directory:join(directory,'operations',id),allocatedSeconds:available,...(kind==='trial'?{actorSeconds:input.actorSeconds,verificationSeconds:input.verificationSeconds}:{}),elapsedSeconds:0,runningAt:wall()};
+   state.operations[id]=op;working.set(id,{at:now(),prior:0});await mkdir(trialAttemptDirectory(op),{recursive:true});await persist();
    const timeout=AbortSignal.timeout(Math.max(1,Math.ceil(available*1000))),bounded=AbortSignal.any([active,timeout]);
-   try{const answer=await fn({...clone(input),directory:op.directory,remainingSeconds:available,signal:bounded});
+   try{const answer=await fn({...clone(input),directory:trialAttemptDirectory(op),remainingSeconds:available,signal:bounded});
     if(bounded.aborted||(now()-working.get(id).at)/1000>available||remaining()<=0){op.result={infrastructure:true,correct:null,reason:'Operation elapsed allocation exhausted before result admission'};op.status='complete';throw Error('Operation elapsed allocation exhausted');}
     op.result=clone(answer);op.status='complete';return clone(answer);}
    finally{const start=working.get(id);op.elapsedSeconds=start.prior+Math.max(0,now()-start.at)/1000;working.delete(id);if(op.status==='complete')delete op.runningAt;else op.runningAt=wall();await persist();}
@@ -122,9 +141,11 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
    const outputs=Object.fromEntries(arms.map(a=>[a.id,[]]));let cursor=0,failure;
    const workers=Array.from({length:Math.min(concurrency,cells.length)},async()=>{
     while(!failure&&cursor<cells.length){const {arm,repetition}=cells[cursor++],id=[phase,family.id,task.id,arm.id,repetition].join('--');
-     try{const answer=validatePilotTrial(await invoke(id,'trial',{phase,familyId:family.id,task,arm:arm.id,guidance:arm.text,repetition,identities:manifest.identities,...(manifest.mode?{mode:manifest.mode}:{}),actorSeconds:trialSeconds,verificationSeconds},dependencies.trial,trialSeconds+verificationSeconds),task);outputs[arm.id][repetition]=answer;
+     try{let answer;do{answer=validatePilotTrial(await invoke(id,'trial',{phase,familyId:family.id,task,arm:arm.id,guidance:arm.text,repetition,identities:manifest.identities,...(manifest.mode?{mode:manifest.mode}:{}),actorSeconds:trialSeconds,verificationSeconds},dependencies.trial,trialSeconds+verificationSeconds),task);
+      }while(dependencies.settle&&interruptedTrial(state.operations[id]));
+      outputs[arm.id][repetition]=answer;
       if(answer.infrastructure)throw Object.assign(Error(answer.reason),{code:'PILOT_INFRASTRUCTURE'});}
-     catch(error){failure??=error;if(error.code!=='PILOT_ADMISSION_BUDGET')end.abort(failure);}
+     catch(error){failure??=error;}
     }
    });await Promise.all(workers);if(failure)throw failure;
    return outputs;
@@ -203,7 +224,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   return await result('complete',promising?'Transfer improvement demonstrated':'No demonstrated transfer improvement',{promising});
  }catch(error){
   if(!state||readOnly)throw error;
-  return await result(Object.values(state.operations).some(op=>op.status==='running')?'needs-settlement':'inconclusive',error.message);
+  return await result(error.code==='PILOT_CUSTODY'||Object.values(state.operations).some(op=>op.status==='running')?'needs-settlement':'inconclusive',error.message);
  }finally{
   clearInterval(timer);
   if(state&&!readOnly&&!finalised){charge();if(!Object.values(state.operations).some(op=>op.status==='running'))delete state.runningAt;await writes;await save(file,state);}
@@ -247,7 +268,7 @@ export async function replayRetainedFailureTask({directory,taskId,candidateId,ch
   for(const [repetition,row]of rows.entries()){
    const id=[phase,family.id,taskId,actor,repetition].join('--');
    const operation=pilot.operations[id];
-   const retained=await load(join(directory,'operations',id,'source-manifest.json'));
+   const retained=await load(join(trialAttemptDirectory({...operation,directory:join(directory,'operations',id)}),'source-manifest.json'));
    assert(operation?.result&&!row.infrastructure&&isHash(row.sourceSha256)&&retained?.cwd&&retained.files,
     'Every replay row requires retained trusted actor bytes');
    assert.deepEqual(validatePilotTrial(operation.result,task),row,'Historical verdict changed');

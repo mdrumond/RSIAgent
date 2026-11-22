@@ -354,3 +354,37 @@ for(const wins of [true,false])test('retained replay binds all saved actors and 
  await assert.rejects(replayRetainedFailureTask({directory:f.directory,taskId:'development',candidateId,checkerSha256:hash('another checker')},
   {score:async ()=>assert.fail('No replay after source drift')}),/Source hash mismatch/);
 });
+
+test('closed Pi timeout retries its own cell with fresh comparable grants while siblings finish',async t=>{
+ const f=await fixture(t),calls=[],timeouts=new Set();
+ const options={...f.options,verificationSeconds:2};
+ const report=await runFailurePilot(options,{...f.ops,
+  settle:async op=>{assert.equal(op.result.reason,'Native session failed: Request timed out.');return {closed:true};},
+  trial:async input=>{
+   calls.push(input);
+   if(input.repetition===0&&!timeouts.size){timeouts.add(input.directory);return {infrastructure:true,correct:null,reason:'Native session failed: Request timed out.'};}
+   await delay(5);input.signal.throwIfAborted();return result(true);
+  }});
+ assert.equal(report.status,'complete');assert.equal(calls.length,6);
+ const op=Object.values(report.operations).find(op=>op.attempts);
+ assert.equal(op.attempts.length,1);assert.equal(op.attempts[0].result.correct,null);
+ assert.equal(report.screens.first.length,5);assert(report.screens.first.every(row=>row.correct));
+ assert.equal(new Set(calls.map(input=>input.directory)).size,6);
+ assert(calls.every(input=>input.remainingSeconds===12&&input.actorSeconds===10&&input.verificationSeconds===2));
+ assert(report.elapsedSeconds>=1);
+});
+
+test('old sibling cancellation migrates only after settlement and leaves scored siblings and qualification intact',async t=>{
+ const f=await fixture(t),calls=[],protocol={...f.ops,trial:async()=>result(true)};
+ const original=await runFailurePilot(f.options,protocol);
+ const op=Object.values(original.operations).find(op=>op.kind==='trial');
+ op.result={infrastructure:true,correct:null,reason:'Operation elapsed allocation exhausted before result admission'};
+ op.elapsedSeconds=3;original.status='inconclusive';original.screens={};
+ await writeFile(join(f.directory,'pilot.json'),JSON.stringify(original));
+ const adapters={...protocol,qualify:()=>assert.fail('Qualification repeated'),trial:async input=>{calls.push(input.repetition);return result(true);}};
+ const blocked=await runFailurePilot(f.options,{...adapters,settle:async()=>({closed:false})});
+ assert.equal(blocked.status,'needs-settlement');assert.deepEqual(calls,[]);
+ const recovered=await runFailurePilot(f.options,{...adapters,settle:async()=>({closed:true})});
+ assert.equal(recovered.status,'complete');assert.equal(calls.length,1);assert.equal(recovered.operations[op.id].attempts[0].elapsedSeconds,3);
+ assert.deepEqual(recovered.qualifications,original.qualifications);
+});
