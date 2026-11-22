@@ -198,6 +198,9 @@ def main():
                                                      'record-lesson'], default='serve')
     parser.add_argument('--arguments', default='{}', help='JSON backend arguments')
     args = parser.parse_args()
+    # Tokenizers otherwise creates a host-sized Rayon pool on the first batch.
+    if "RAYON_NUM_THREADS" not in os.environ:
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     def backend_factory():
         if args.embedding_factory:
             from importlib import import_module
