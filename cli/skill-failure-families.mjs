@@ -233,13 +233,13 @@ async function checkPythonSyntax({config,family,manifest,directory,signal}){
 
 const selector=Type.Object({reference:Type.String(),startLine:Type.Optional(Type.Integer({minimum:1})),endLine:Type.Optional(Type.Integer({minimum:1})),segment:Type.Optional(Type.Integer({minimum:1})),field:Type.Optional(Type.String())},{additionalProperties:false});
 const nameSchema=Type.String({minLength:1}),fileMap=Type.Record(Type.String(),nameSchema),controlSchema=Type.Object({files:fileMap},{additionalProperties:false});
-const taskSchema=target=>Type.Object({id:nameSchema,prompt:nameSchema,caseIds:Type.Array(nameSchema,{minItems:1}),controlCaseIds:Type.Optional(Type.Array(nameSchema)),files:fileMap,checker:nameSchema,publicChecker:nameSchema,checkerFiles:Type.Optional(fileMap),controls:Type.Object({reference:controlSchema,negatives:Type.Array(controlSchema,{minItems:1}),calibration:target==='a5'?controlSchema:Type.Optional(controlSchema)},{additionalProperties:false}),changeType:Type.Optional(Type.Union(['layout','operation','dtype','boundary'].map(Type.Literal))),relation:Type.Optional(nameSchema)},{additionalProperties:false});
-const familySchema=target=>Type.Object({format:Type.Literal(2),id:nameSchema,target:Type.Literal(target),objective:Type.Literal('correctness'),mechanism:Type.Object({phase:nameSchema,type:nameSchema},{additionalProperties:false}),provenance:Type.Object({reference:nameSchema,attemptId:Type.Optional(nameSchema),projectId:Type.Optional(nameSchema),source:Type.Object({path:Type.Optional(nameSchema),snapshotReference:Type.Optional(nameSchema),iterationId:Type.Optional(Type.Integer({minimum:1})),repository:Type.Optional(nameSchema),file:Type.Optional(nameSchema)},{additionalProperties:false}),isolationEdits:Type.Optional(nameSchema)},{additionalProperties:false}),development:taskSchema(target),transfer:Type.Array(taskSchema(target),{minItems:2,maxItems:2})},{additionalProperties:false});
+const taskSchema=(target,focused)=>Type.Object({id:nameSchema,prompt:nameSchema,caseIds:Type.Array(nameSchema,{minItems:1}),controlCaseIds:Type.Optional(Type.Array(nameSchema)),files:fileMap,checker:nameSchema,publicChecker:nameSchema,checkerFiles:Type.Optional(fileMap),controls:Type.Object({reference:controlSchema,negatives:Type.Array(controlSchema,{minItems:1}),calibration:focused||target==='a5'?controlSchema:Type.Optional(controlSchema)},{additionalProperties:false}),changeType:Type.Optional(Type.Union(['layout','operation','dtype','boundary'].map(Type.Literal))),relation:Type.Optional(nameSchema)},{additionalProperties:false});
+const familySchema=(target,focused)=>Type.Object({format:Type.Literal(2),id:nameSchema,target:Type.Literal(target),objective:Type.Literal('correctness'),mechanism:Type.Object({phase:nameSchema,type:nameSchema},{additionalProperties:false}),provenance:Type.Object({reference:nameSchema,attemptId:Type.Optional(nameSchema),projectId:Type.Optional(nameSchema),source:Type.Object({path:Type.Optional(nameSchema),snapshotReference:Type.Optional(nameSchema),iterationId:Type.Optional(Type.Integer({minimum:1})),repository:Type.Optional(nameSchema),file:Type.Optional(nameSchema)},{additionalProperties:false}),isolationEdits:Type.Optional(nameSchema)},{additionalProperties:false}),development:taskSchema(target,focused),transfer:Type.Array(taskSchema(target,focused),{minItems:2,maxItems:2})},{additionalProperties:false});
 const claimSchema=Type.Array(Type.Object({path:Type.Literal('reason'),kind:Type.Union([Type.Literal('observation'),Type.Literal('hypothesis')]),proofs:Type.Array(selector,{minItems:1})},{additionalProperties:false}),{minItems:1});
 const missingEvidence=['retained-source','failure-mechanism','passing-reference','missing-semantics','unreliable-oracle'];
 const isOracleGap=blocker=>['missing-semantics','unreliable-oracle'].includes(blocker);
-const resultSchema=target=>Type.Union([
- Type.Object({status:Type.Literal('ready'),reason:nameSchema,family:familySchema(target),claims:claimSchema},{additionalProperties:false}),
+const resultSchema=(target,focused)=>Type.Union([
+ Type.Object({status:Type.Literal('ready'),reason:nameSchema,family:familySchema(target,focused),claims:claimSchema},{additionalProperties:false}),
  Type.Object({status:Type.Literal('needs-evidence'),missing:Type.Union(missingEvidence.map(Type.Literal)),reason:nameSchema,verificationReference:nameSchema,
   nextQuestion:Type.Optional(nameSchema),claims:claimSchema},{additionalProperties:false})
 ]);
@@ -370,7 +370,7 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
      task:'Continue the current question from the saved draft and trusted checker feedback. Prior dialogue is unavailable.',
      trustedChecker:lastChecked?{reason:lastChecked.reason,diagnostics:observations[lastChecked.reference]??[]}:null
     }:null;
-    result=await session({directory:research,config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.flatMap(source=>[source.path,...source.replayInputs.map(input=>input.path)])],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target),
+    result=await session({directory:research,config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.flatMap(source=>[source.path,...source.replayInputs.map(input=>input.path)])],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target,focusedCalibration),
    onModelTiming:(kind,seconds)=>{timings[kind]+=seconds;},
    prompt:{...(approvedInstruction?{approvedInstruction,testObjective:'Design or reuse a discriminating experiment for this immutable instruction and the original ranked failure. Keep the evaluated actor task blind to the instruction.'}:{}),...(authorRecovery?{recovery:authorRecovery}:{}),target:config.target,draftDirectory:draft,focusedQuestion:{number:question.number,prompt:nextQuestion},task:authorInstructions(focusedCalibration),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
    validate:async value=>{
@@ -378,7 +378,7 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
     if(!value.family||value.files)throw Error('Submit a typed family manifest referencing draftDirectory files, without inline file contents');
     if(focusedCalibration){
      for(const task of [value.family.development,...(value.family.transfer??[])]){
-      if(!text(task?.controls?.calibration?.files?.['kernel.py']))throw Error('A5 task '+(task?.id??'unknown')+' requires a calibration kernel before qualification');
+      if(!text(task?.controls?.calibration?.files?.['kernel.py']))throw Error(config.target.toUpperCase()+' task '+(task?.id??'unknown')+' requires a calibration kernel before qualification');
      }
     }
     await freezeDraft(value.family,draft,directory);
@@ -388,7 +388,7 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
       const calibration=task.controls.calibration.files['kernel.py'];
       const controls=[['reference',task.controls.reference.files],...task.controls.negatives.map((negative,index)=>['negative '+(index+1),negative.files]),['starter',task.files]];
       for(const [label,files] of controls){
-       if(calibration===files['kernel.py'])throw Error('A5 task '+task.id+' calibration kernel duplicates the '+label+'; supply a separate passing implementation');
+       if(calibration===files['kernel.py'])throw Error(config.target.toUpperCase()+' task '+task.id+' calibration kernel duplicates the '+label+'; supply a separate passing implementation');
       }
      }
     }

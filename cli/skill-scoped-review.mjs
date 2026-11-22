@@ -7,7 +7,8 @@ import {Type} from 'typebox';
 import {reviewSession} from './skill-review-native.mjs';
 
 export const scopedPolicy='scoped-v1';
-export const artifactHash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const textHash=value=>createHash('sha256').update(value).digest('hex');
+const artifactHash=value=>textHash(JSON.stringify(value));
 const nonempty=Type.String({minLength:1});
 const verdictSchema=Type.Union([
  Type.Object({verdict:Type.Literal('approved')},{additionalProperties:false}),
@@ -15,7 +16,7 @@ const verdictSchema=Type.Union([
 ]);
 
 export function scopedReviewIdentity({scope,brief,fields,sources=[]}){
- return artifactHash({scope,brief,fields,sources:sources.map(({reference,text})=>[reference,artifactHash(text)])});
+ return artifactHash({scope,brief,fields,sources:sources.map(({reference,text})=>[reference,textHash(text)])});
 }
 
 // Pi retries individual requests. Reopen a closed timed-out turn under its original elapsed grant.
@@ -46,7 +47,7 @@ export async function reviewScopedArtifact({scope,fields,brief,directory,config,
  await mkdir(sourceDirectory,{recursive:true});
  async function page(name,text){
   const path=join(sourceDirectory,artifactHash([name,text])+'.txt');await writeFile(path,text);
-  return {name,path,sha256:artifactHash(text),preview:text.slice(0,1200)};
+  return {name,path,sha256:textHash(text),preview:text.slice(0,1200)};
  }
  const displayed={};
  for(const [key,text] of Object.entries(fields))displayed[key]=text.length<=2000?text:await page(key,text);
@@ -56,7 +57,6 @@ export async function reviewScopedArtifact({scope,fields,brief,directory,config,
   prompt:{scope,brief,fields:displayed,evidence,task:scope==='writing'?'Review only the proposed instruction for factual accuracy, applicability to the ranked issue, and clear reusable guidance. Benchmark design and empirical effectiveness are evaluated later. Approve the submitted text or quote one material defect for the writer.':'Review whether this test discriminates the ranked failure, whether the oracle and controls test the stated mechanism, and whether transfers preserve it. Inspect the referenced checker files. Approve the submitted test or quote one material defect for the test author.'},validate});
  return {...validate(value),identity:scopedReviewIdentity({scope,brief,fields,sources})};
 }
-
 
 export async function reviewScopedTest({writing,family,directory,config,seconds,signal},review=reviewScopedArtifact){
  const fields={mechanism:JSON.stringify(family.mechanism)};

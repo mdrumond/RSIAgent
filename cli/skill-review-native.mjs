@@ -118,6 +118,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   if(cached&&schema===classificationSchema){const {groupId,intervention,...submitted}=candidate;candidate=submitted;}
   if(cached&&isClassificationBatch)candidate={...candidate,classifications:candidate.classifications?.map(({intervention,triage,...submitted})=>submitted)};
   if((proofRequired||resultSchema)&&!Check(schema,candidate)){const paths=Errors(schema,candidate).slice(0,4).map(e=>(e.instancePath||'/')+' '+e.message).join('; ');
+   if(!proofRequired)throw Error('Match the submit_review result schema. Invalid fields: '+paths);
    throw Error((selectorOnly?'Submit only the result schema: claims contain path, kind and selector-only proofs {reference,startLine?,endLine?,segment?,field?}; omit claim.text, quote, hashes, fact values and input metadata.':'Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.')+' Invalid fields: '+paths);
   }
   if(requiredReads.some(path=>!seen.has('file:'+resolve(path))))throw Error('Read these primary source files before summary audit: '+JSON.stringify(requiredReads.filter(path=>!seen.has('file:'+resolve(path)))));
