@@ -125,7 +125,8 @@ async function isolationInputs({root,db,attempt,row,source,directory,signal}){
     if(info.isFile()&&info.size<=1048576&&bytes+info.size<=8388608)
      await retain(name,role,await readFile(path),provenance);
    };
-   if(text(proposal.verifier)&&!isAbsolute(proposal.verifier))await readArchived(proposal.verifier,'verifier');
+   const localName=name=>text(name)&&inside(base,resolve(base,name))?relative(base,resolve(base,name)):null;
+   const verifier=localName(proposal.verifier);if(verifier)await readArchived(verifier,'verifier');
    const controls=proposal.controls??{},fixtures=[[controls.positive,'positive-control'],...(Array.isArray(controls.negative)?controls.negative.slice(0,8):[]).map(name=>[name,'negative-control'])];
    let inspected=0;
    async function visit(name,role){
@@ -142,7 +143,7 @@ async function isolationInputs({root,db,attempt,row,source,directory,signal}){
      else if(entry.isFile())await readArchived(child,role);
     }
    }
-   for(const [name,role] of fixtures)if(text(name)&&name!=='.'&&name!=='..'&&name!=='source'&&dirname(name)==='.')await visit(name,role);
+   for(const [submitted,role] of fixtures){const name=localName(submitted);if(name&&name!=='source'&&dirname(name)==='.')await visit(name,role);}
   }
  }
  return files;
