@@ -16,7 +16,7 @@ const family={id:'actual-failure',development:task('development'),transfer:[task
 const result=correct=>({correct,mechanismMatch:!correct,caseResults:['large','control'].map(id=>({id,correct})),sourceSha256:'a'.repeat(64),artifacts:[],handles:[]});
 async function fixture(t,target='a3'){
  const root=await mkdtemp(join(tmpdir(),'failure-campaign-'));t.after(()=>rm(root,{recursive:true,force:true}));
- const config={format:1,root,target,mode:'phase1',projects:[],concurrency:5,actor:{},environment:{options:{target:'fixture'}},skills:{activeVersion:'base',background:true,tuningDisabled:false,failureFirst:{enabled:true,sourceRevision:'a'.repeat(40)}}};
+ const config={format:1,root,target,mode:'phase1',projects:[],concurrency:5,actor:{},environment:{options:{target:'fixture'}},skills:{activeVersion:'base',background:true,tuningDisabled:false,failureFirst:{enabled:true,experimentPolicy:'legacy',sourceRevision:'a'.repeat(40)}}};
  await writeFile(join(root,'instance.json'),JSON.stringify(config));const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());state.db.exec('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
  for(const [key,value]of Object.entries({pause:true,'campaign-budget':{seconds:10000,elapsed:125,cycle:'retained',boot:'prior-boot',monotonic:0,running:false}}))state.db.prepare('insert into control values(?,?)').run(key,JSON.stringify(value));
  state.event(null,'generation-rejected',{message:'Actual test fixture rejection'});const backlog=new SkillBacklog(state,{target});backlog.ingest();const g=backlog.failures()[0];backlog.acknowledge(g.id);
@@ -337,7 +337,7 @@ test('scoped campaign repairs immutable writing and test independently before ma
  const {stages}=await import('../../controller/workflow.mjs');
  for(const baseline of ['pass','unrelated','reproduced']){
   const f=await fixture(t,'a5'),events=[],approved='Check the shape assumptions against all supported inputs.';
-  f.config.skills.failureFirst.experimentPolicy='scoped-v1';await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
+  delete f.config.skills.failureFirst.experimentPolicy;await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
   const base=join(f.root,'skills','versions','base'),scopeNames=['global-kdb',...stages];
   await mkdir(base,{recursive:true});await writeFile(join(base,'skill-map.json'),JSON.stringify(Object.fromEntries(scopeNames.map(s=>[s,s+'.md']))));
   await writeFile(join(base,'guidance.json'),JSON.stringify(scopeNames.map(scope=>({id:scope,scope,text:'Base '+scope,critical:true,negative:false}))));
@@ -359,7 +359,7 @@ test('scoped campaign repairs immutable writing and test independently before ma
    family:async args=>{
     assert.equal(args.approvedInstruction.text,approved);let submitted;
     for(const prompt of ['Return zero','Repair the implementation']){
-     events.push(['test-author',prompt]);const tasks=['development','stride','layout'].map((id,i)=>({...task(id),files:{'kernel.py':'source '+i},prompt,checker,publicChecker:checker,changeType:['','layout','boundary'][i],relation:'Transfer',controls:{negatives:[{files:{}}],calibration:{files:{}},reference:{files:{}}}}));
+     events.push(['test-author',prompt]);const tasks=['development','stride','layout'].map((id,i)=>({...task(id),controlCaseIds:prompt==='Return zero'?['large']:['control'],files:{'kernel.py':'source '+i},prompt,checker,publicChecker:checker,changeType:['','layout','boundary'][i],relation:'Transfer',controls:{negatives:[{files:{}}],calibration:{files:{}},reference:{files:{}}}}));
      submitted={id:'family',identity:prompt,mechanism:{phase:'check',type:'shape'},development:tasks[0],transfer:tasks.slice(1)};
      try{await args.checkReferences({family:submitted,seconds:60,signal:args.signal});break;}
      catch(error){assert.equal(error.code,'FAILURE_REFERENCE_REJECTED');assert.match(error.message,/ignores the input/);}
@@ -367,8 +367,8 @@ test('scoped campaign repairs immutable writing and test independently before ma
     return {status:'ready',family:submitted};
    },
    testReview:args=>reviewScopedTest(args,request=>reviewScopedArtifact(request,async model=>{
-    const {fields}=model.prompt;assert.equal(fields['development.checker'],'pass');assert(fields['development.controls']);assert.deepEqual(model.evidenceGroups,groups);events.push(['test-review',fields['development.prompt']]);
-    return {value:model.validate(fields['development.prompt']==='Return zero'?{verdict:'revise',field:'development.prompt',quote:'Return zero',defect:'This ignores the input.'}:{verdict:'approved'})};
+    const {fields}=model.prompt;assert.equal(fields['development.checker'],'pass');assert.equal(fields['stride.changeType'],'layout');assert(fields['development.controls']);assert.deepEqual(model.evidenceGroups,groups);events.push(['test-review',fields['development.prompt']]);
+    return {value:model.validate(JSON.parse(fields['development.controlCaseIds']).includes('large')?{verdict:'revise',field:'development.controlCaseIds',quote:'large',defect:'The wrong control designation ignores the input.'}:{verdict:'approved'})};
    })),
    runtime:async()=>({...await f.ops.runtime(),checkReferences:async()=>({diagnostics:[]}),qualify:async()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true}),
     trial:async input=>{events.push(['trial',input.arm]);if(input.arm!=='baseline')assert(input.guidance.includes(approved));
@@ -400,4 +400,27 @@ test('a normally closed writer without submission releases its family and leaves
  const result=await runCampaignFailureStep(f.config,f.values,{...f.ops,writing:async()=>{throw error;},runtime:async()=>assert.fail('Closed writer requested evaluation')});
  assert.equal(result.status,'inconclusive');assert.equal(result.reason,'writing-no-submit');
  assert.equal(f.backlog.run(f.item.id),null);
+});
+
+test('an old running checkpoint retains its screened-before-writing protocol when fresh experiments default to scoped QA',async t=>{
+ const f=await fixture(t);delete f.config.skills.failureFirst.experimentPolicy;
+ const {run}=f.backlog.claim({base:'base',itemId:f.item.id,seconds:7200,workflow:'failure-first-v1'});
+ f.backlog.checkpoint(run.id,{elapsed:0,checkpoint:{workflow:'failure-first-v1',startedAt:Date.now(),directory:join(f.root,'old-run'),slots}});
+ const result=await runCampaignFailureStep(f.config,f.values,{...f.ops,writing:async()=>assert.fail('Changed retained writing contract')});
+ assert.equal(result.status,'accepted');assert.equal(f.calls.filter(x=>x[0]==='design').length,1);
+ assert.equal(failureProtocol(f.config).candidates,1);
+});
+
+test('a changed reviewed artifact gets a new native submission and unchanged inputs reuse it',async t=>{
+ const {reviewScopedArtifact}=await import('../../cli/skill-scoped-review.mjs');
+ const f=await fixture(t),answers=new Map();
+ const session=async input=>{
+  if(!answers.has(input.directory))answers.set(input.directory,input.validate(input.prompt.fields.text==='Known limitation'
+   ?{verdict:'approved'}:{verdict:'revise',field:'text',quote:'invented',defect:'Unsupported by the evidence.'}));
+  return {value:answers.get(input.directory)};
+ };
+ const args={directory:join(f.root,'shared-review'),scope:'writing',brief:{issue:'fixture'},seconds:5};
+ for(const [text,verdict] of [['Known limitation','approved'],['An invented limit','revise'],['Known limitation','approved']])
+  assert.equal((await reviewScopedArtifact({...args,fields:{text}},session)).verdict,verdict);
+ assert.equal(answers.size,2);
 });

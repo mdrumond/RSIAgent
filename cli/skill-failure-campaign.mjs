@@ -14,7 +14,7 @@ import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {readConfig} from './instance.mjs';
 import {skillInput} from './skill-microeval.mjs';
 import {skillModelIdentity,skillConfig} from '../controller/skill-context.mjs';
-import {scopedPolicy,reviewScopedTest} from './skill-scoped-review.mjs';
+import {experimentPolicy,scopedPolicy,reviewScopedTest} from './skill-scoped-review.mjs';
 import {runFailurePilot} from './skill-failure-pilot.mjs';
 import {failureTiming} from './skill-failure-protocol.mjs';
 import {searchableMemoryFingerprint} from './skill-searchable.mjs';
@@ -164,7 +164,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   if(campaignLeft()<=0)throw Error('Campaign elapsed allowance exhausted');
   const claimed=backlog.claim({base:config.skills.activeVersion,itemId:item.id,seconds:Math.min(failureTiming.experimentSeconds,campaignLeft()),workflow:'failure-first-v1',owner});
   if(!claimed)return {status:'idle',reason:'Family already completed'};
-  run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now(),directory:join(config.root,'skills','priority','failure-first',run.id),slots,...(config.skills.failureFirst.experimentPolicy===scopedPolicy?{experimentPolicy:scopedPolicy}:{})};
+  run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now(),directory:join(config.root,'skills','priority','failure-first',run.id),slots,experimentPolicy:existing?'legacy':experimentPolicy(config.skills.failureFirst)};
   if(cp.workflow!=='failure-first-v1'||hash(cp.slots)!==hash(slots))throw Error('Retained experiment requires its exact original resource bindings');
   const resumedAt=now(),retainedElapsed=Math.max(run.elapsed,(resumedAt-cp.startedAt)/1000);
   const elapsed=()=>retainedElapsed+(now()-resumedAt)/1000;
