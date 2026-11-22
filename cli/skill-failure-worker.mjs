@@ -10,7 +10,7 @@ import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {deviceLeaseReceipt} from '../integrations/environments/device-leases.mjs';
 import {readConfig,updateConfigImmediate} from './instance.mjs';
 import {withSkillLock} from './evolution-lock.mjs';
-import {failureFirstEnabled,runCampaignFailureStep,failureMemoryGeneration,failureCampaignSettled} from './skill-failure-campaign.mjs';
+import {failureFirstEnabled,runCampaignFailureStep,failureMemoryGeneration,failureCampaignSettled,failureCampaignStatus} from './skill-failure-campaign.mjs';
 import {failureTiming} from './skill-failure-protocol.mjs';
 
 const get=(state,key)=>JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null');
@@ -71,7 +71,11 @@ export async function runFailureCampaign(config,{signal,once=false}={},dependenc
     status(result.status,{reason:result.reason,...(result.stage?{stage:result.stage}:{}),
      ...(result.disposition?{disposition:result.disposition}:{}),...(result.learningRequest?{learningRequest:result.learningRequest}:{})});
     if(once)return result;
-    if(result.status==='idle')await ops.wait(30000,undefined,{signal:active});
+    if(result.status==='idle'){
+     const pending=await failureCampaignStatus(config);
+     if(pending.dirtyFailures>0&&!pending.hasWork)return result;
+     await ops.wait(30000,undefined,{signal:active});
+    }
    }
    active.throwIfAborted();
   }catch(error){

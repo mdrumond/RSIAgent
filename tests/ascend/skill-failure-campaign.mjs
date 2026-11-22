@@ -8,7 +8,7 @@ import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {claimLearningRequest} from '../../controller/skill-review.mjs';
 import {main} from '../../cli/main.mjs';
 import {runCampaignFailureStep,failureCampaignStatus,failureCampaignSettled} from '../../cli/skill-failure-campaign.mjs';
-import {failureProtocol,selectFailureSlots} from '../../cli/skill-failure-worker.mjs';
+import {runFailureCampaign,failureProtocol,selectFailureSlots} from '../../cli/skill-failure-worker.mjs';
 
 const slots=Array.from({length:4},(_,i)=>({resource:{id:'slot-'+i,available:true,metadata:{kind:'host-slot',pool:'cpu-fixture',hostSlot:i}},physical:i}));
 const task=id=>({id,caseIds:['large','control'],controlCaseIds:['control'],files:{'kernel.py':'starter'},prompt:'Repair the isolated behavior'});
@@ -296,4 +296,26 @@ for(const kind of ['no-submit','rejected-submissions'])test('A5 sets aside a clo
  assert.equal(outcome.status,'inconclusive');
  assert.equal(outcome.reason,'family-unsubmitted');
  assert.equal((await failureCampaignStatus(f.config)).current,null);
+});
+
+test('continuous worker releases resources after the last classification page blocks',async t=>{
+ const f=await fixture(t);
+ f.backlog.revise(f.item.id,{status:'deferred'});
+ f.backlog.reclassify(f.item.groupIds[0]);
+ const {analyzeBacklog}=await import('../../cli/skill-backlog-analysis.mjs');
+ const version=join(f.root,'skills','versions','base');
+ await mkdir(version,{recursive:true});await writeFile(join(version,'guidance.json'),'[]');
+ let closed=false;
+ const result=await runFailureCampaign(f.config,{},{
+  lock:(_c,fn)=>fn(),slots:async()=>slots,settled:async()=>true,
+  read:async()=>f.config,memory:async()=>({...f.memory,close:async()=>{closed=true;}}),
+  update:()=>assert.fail('A blocked page must not disable tuning'),
+  wait:()=>assert.fail('No classifiable page remains'),
+  step:(config,args)=>runCampaignFailureStep(config,args,{analyze:input=>analyzeBacklog(input,{
+   classify:async()=>{throw Object.assign(Error('No submission'),{reviewSession:{kind:'no-submit'}});}
+  })})
+ });
+ assert.equal(result.classificationPage,'blocked');
+ assert.equal(closed,true);
+ assert.deepEqual(JSON.parse(f.state.db.prepare("SELECT value FROM control WHERE key='skill-background-resources'").get().value),[]);
 });
