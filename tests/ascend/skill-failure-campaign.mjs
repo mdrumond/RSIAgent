@@ -62,10 +62,20 @@ test('an isolated oracle gap queues one claimable Phase 1 request without runnin
 test('scientific QA rejection finishes without development trials',async t=>{
  const f=await fixture(t);const outcome=await runCampaignFailureStep(f.config,f.values,{...f.ops,design:async()=>async()=>({status:'rejected',reason:'Unsupported instruction'})});assert.equal(outcome.status,'rejected');assert.equal(f.calls.filter(c=>c[0]==='trial').length,5);
 });
-test('first infrastructure failure cancels the admitted cells and never starts a fifth',async t=>{
- const f=await fixture(t);let started=0,cancelled=0;
- await assert.rejects(runCampaignFailureStep(f.config,f.values,{...f.ops,runtime:async()=>({...await f.ops.runtime(),trial:async input=>{const n=started++;if(!n)return {infrastructure:true,correct:null,reason:'Memory connection lost'};if(input.signal.aborted)cancelled++;else await new Promise(resolve=>input.signal.addEventListener('abort',()=>{cancelled++;resolve();},{once:true}));return {infrastructure:true,correct:null,reason:'Cancelled sibling'};}})}),/Memory connection lost/);
- assert(started<=4);assert.equal(cancelled,started-1);assert(!f.calls.some(c=>c[0]==='publish'));
+test('terminal infrastructure lets admitted siblings finish and prevents new admissions',async t=>{
+ const f=await fixture(t);let started=0,finished=0;
+ await assert.rejects(runCampaignFailureStep(f.config,f.values,{...f.ops,runtime:async()=>({...await f.ops.runtime(),trial:async input=>{
+  if(started++===0)return {infrastructure:true,correct:null,reason:'Memory connection lost'};
+  await new Promise(resolve=>setTimeout(resolve,25));input.signal.throwIfAborted();finished++;
+  return {infrastructure:true,correct:null,reason:'Independent failure'};
+ }})}),/Memory connection lost/);
+ assert(started<=4);assert.equal(finished,started-1);assert(!f.calls.some(c=>c[0]==='publish'));
+});
+test('closed unavailable design ends the item without disabling background evaluation',async t=>{
+ const f=await fixture(t);
+ const outcome=await runCampaignFailureStep(f.config,f.values,{...f.ops,design:async()=>async()=>({status:'infrastructure',infrastructure:true,correct:null,reason:'Writer allowance exhausted'})});
+ assert.equal(outcome.status,'inconclusive');assert.equal(outcome.stage,'design');
+ assert.equal(f.backlog.meta('failure-first-current'),null);assert(!f.calls.some(c=>c[0]==='publish'));
 });
 test('real CLI entrypoint stops A3 on startup failure without consuming projects or replacing campaign budget',async t=>{
  const f=await fixture(t);const before=f.state.db.prepare('select * from projects').all();let opened=0;

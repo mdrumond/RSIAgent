@@ -69,7 +69,7 @@ test('three writers run independently, cannot see controls, and freeze exact pub
 });
 test('QA revisions are frozen before testing rather than publishing an earlier draft',async t=>{
  const f=await fixture(t);f.deps.qaAnswer=async()=>({answers:Object.fromEntries(qaTopics.map(topic=>[topic,{text:'Supported',refs:['events:1']}])),changes:[{action:'upsert',id:'invalid',scope:'implementation',text:'Replacement',critical:false,negative:false,evidenceRefs:['events:1']}]});
- await assert.rejects(createFailureDesign({config:f.config,item:f.item},f.deps)(f.input),/additive|qa-execution-failed/);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
+ const disposition=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);assert.equal(disposition.status,'infrastructure');assert.match(disposition.reason,/additive|qa-execution-failed/);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
  const g=await fixture(t);g.deps.qaAnswer=async input=>({answers:Object.fromEntries(qaTopics.map(topic=>[topic,{text:'Supported',refs:['events:1']}])),changes:input.proposal.changes.map(change=>({...change,text:change.text+' Verify the preserved behavior independently.'}))});
  const candidates=await createFailureDesign({config:g.config,item:g.item},g.deps)(g.input);for(const candidate of candidates)assert.equal(candidate.instruction,candidate.proposal.changes[0].text);
 });
@@ -522,4 +522,28 @@ test('resume reuses a saved draft while both closed exhausted writers stay idle'
  await rm(join(qa,'qa.json'));
  const second=await runFailurePilot(options,{...base,design:resume,qualify:()=>assert.fail('Repeated controls'),trial:async input=>{assert.notEqual(input.phase,'screen');return result(input.arm!=='baseline');}});
  assert.equal(writes,3);assert.equal(second.promising,true,second.reason);assert.deepEqual(second.candidates.map(row=>row.id),['principle-c']);
+});
+
+test('closed unsubmitted writers leave independently approved guidance intact',async t=>{
+ const f=await fixture(t),session=f.deps.session;
+ f.deps.session=input=>{
+  if(input.directory.includes('principle-c/'))return session(input);
+  throw Object.assign(Error('No valid submission'),{reviewSession:{kind:input.directory.includes('principle-a/')?'no-submit':'rejected-submissions'}});
+ };
+ const rows=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);
+ assert.deepEqual(rows.map(row=>row.id),['principle-c']);
+});
+
+test('panel custody checks only the selected lane and requires a closed or frozen writer',async t=>{
+ const f=await fixture(t),design=createFailureDesign({config:f.config,item:f.item},f.deps);
+ const directory=f.input.directory,lane=join(directory,'principle-b');await mkdir(lane,{recursive:true});
+ const input={qaPolicy:'panel',reviewCandidate:'principle-b'};
+ await writeFile(join(directory,'design-input.json'),JSON.stringify(input));
+ await writeFile(join(lane,'writer-result.json'),JSON.stringify({value:{}}));
+ assert.equal(await design.canResume({directory}),false);
+ await writeFile(join(lane,'writer-spend.json'),JSON.stringify({running:false}));
+ assert.equal(await design.canResume({directory}),true);
+ await rm(join(lane,'writer-spend.json'));
+ await writeFile(join(directory,'design-input.json'),JSON.stringify({...input,frozenQaSha256:'frozen'}));
+ assert.equal(await design.canResume({directory}),true);
 });

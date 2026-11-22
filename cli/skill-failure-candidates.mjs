@@ -24,6 +24,7 @@ const textHash=value=>createHash('sha256').update(value).digest('hex');
 const load=async file=>{try{return JSON.parse(await readFile(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;return null;}};
 const save=async(file,value)=>{await mkdir(join(file,'..'),{recursive:true});const temporary=file+'.'+randomUUID();await writeFile(temporary,JSON.stringify(value,null,2));await rename(temporary,file);};
 const scopes=['global-kdb',...stages];
+const unsubmittedKinds=['no-submit','rejected-submissions'];
 const assertInstruction=value=>{assert(typeof value==='string'&&value.trim()&&value.trim().split(/\s+/).length<=150&&!value.includes('```'),'A short prose instruction of at most 150 words is required');};
 const selector=Type.Object({reference:Type.String({minLength:1}),startLine:Type.Optional(Type.Integer({minimum:1})),endLine:Type.Optional(Type.Integer({minimum:1})),segment:Type.Optional(Type.Integer({minimum:1})),field:Type.Optional(Type.String())},{additionalProperties:false});
 const schema=Type.Object({text:Type.String({minLength:1}),scope:Type.Union(scopes.map(value=>Type.Literal(value))),memoryRefs:Type.Array(Type.String({minLength:1}),{minItems:1}),claims:Type.Array(Type.Object({path:Type.Literal('text'),kind:Type.Union([Type.Literal('observation'),Type.Literal('hypothesis')]),proofs:Type.Array(selector,{minItems:1})},{additionalProperties:false}),{minItems:1})},{additionalProperties:false});
@@ -81,6 +82,7 @@ async function writerCall(directory,seconds,signal,fn,now){
  }catch(error){
   const terminal=error?.reviewSession;
   signal?.throwIfAborted();
+  if(unsubmittedKinds.includes(terminal?.kind)||terminal?.kind==='provider-error'&&!terminal.retryableTimeout)return {unavailable:terminal.kind};
   if(terminal?.kind==='elapsed'||terminal?.retryableTimeout===true&&terminal.kind==='provider-error')return {providerTimeout:terminal.kind};
   throw error;
  }finally{clearInterval(timer);await writes;await save(file,snapshot(false));}
@@ -144,8 +146,12 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    await mkdir(directory,{recursive:true});const resultFile=join(directory,'writer-result.json');let written=await load(resultFile);
    const validate=(value,retrievals)=>{assertInstruction(value.text);assert(scopes.includes(value.scope),'Unknown instruction scope');const known=new Set(memoryEntries(retrievals).map(entry=>entry.ref));assert(value.memoryRefs?.length&&value.memoryRefs.every(ref=>known.has(ref)),'Supporting memory must use retrieved collection:chunk_id references. Allowed: '+JSON.stringify([...known]));return value;};
    if(input.frozenQa)assert(written,'Frozen panel replay requires its retained writer result');
-   if(!written){let outcome,pause=1;do{outcome=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords:writerProofRecords,evidenceGroups:groups,
+   if(!written){
+    const previous=await load(join(directory,'writer','termination.json'));
+    if(unsubmittedKinds.includes(previous?.kind)||previous?.kind==='provider-error'&&!previous.retryableTimeout)return {id,unavailable:previous.kind};
+    let outcome,pause=1;do{outcome=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords:writerProofRecords,evidenceGroups:groups,
      prompt:{...(input.revisionFeedback?{revisionFeedback:input.revisionFeedback}:{}),task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,...(panelRevisionSources.length?{revisionSources:panelRevisionSources}:{}),entries},validate}),ops.now);
+    if(outcome.unavailable)return {id,unavailable:outcome.unavailable};
     if(!outcome.providerTimeout)break;
     const spent=await load(join(directory,'writer-spend.json'));
     if(outcome.providerTimeout==='elapsed'||Math.min(left(),spent.seconds-spent.elapsedSeconds)<=pause)return {id,providerTimeout:outcome.providerTimeout};
@@ -161,7 +167,7 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    const validateProposal=value=>{validateReviewProposal(value,groups,item.preparation?.classifications??{});assert(value.changes?.length===1&&value.changes[0].id===changeId&&value.changes[0].action==='upsert'&&value.changes[0].critical===false&&value.changes[0].negative===false,'Only one additive instruction may be reviewed');assertInstruction(value.changes[0].text);assert(value.memoryRefs.every(ref=>memoryEvidence.some(entry=>entry.ref===ref)),'QA cannot introduce unretrieved memory');return value;};
    let qa,pause=1;do{qa=await ops.qa({directory:join(directory,'qa'),config:sessionConfig,proposal:validateProposal(proposal),groups,entries,objective:'correctness',target:config.target,memoryEvidence,proposalDirectory:join(directory,'writer'),validateProposal,
     ...(panel?{qaPolicy:'panel',frozenQa:input.frozenQa,qaPanelConcurrency:input.qaPanelConcurrency,panelAuditEvidence:input.panelAuditEvidence,panelRevisionSources,retryMissingPanelVotes:input.retryMissingPanelVotes}:{}),allowWriterRevision:focused&&!input.revisionFeedback,evaluationContract,seconds:Math.min(panel?1020:600,left()),signal:AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000)))])},{qaAnswer:async request=>{const response=await ops.qaAnswer(request);return response?.value??response;},qaReview:async request=>{const response=await ops.qaReview(request);return panel?response:response?.value??response;},qaPanelAudit:ops.qaPanelAudit});
-   if(qa.reasonKind!=='infrastructure'||!qa.retryable||Math.min(left(),qa.seconds-qa.elapsedSeconds)<=pause)break;
+   if(panel||qa.reasonKind!=='infrastructure'||!qa.retryable||!qa.error?.reviewSession?.retryableTimeout||Math.min(left(),qa.seconds-qa.elapsedSeconds)<=pause)break;
    await delay(pause*1000,undefined,{signal:input.signal});pause=Math.min(60,pause*2);
    }while(left()>0);
    if(qa.verdict!=='approved')throw Object.assign(Error(qa.reason??'Instruction review rejected'),{code:qa.reasonKind==='infrastructure'?'FAILURE_DESIGN_INFRASTRUCTURE':'FAILURE_DESIGN_REJECTED',...(qa.revisionFeedback?.trim()?{revisionFeedback:panel?qa.revisionFeedback:id+': '+qa.revisionFeedback}:{} )});
@@ -175,29 +181,34 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   input.signal?.throwIfAborted();
   const unexpected=failures.find(row=>!['FAILURE_DESIGN_INFRASTRUCTURE','FAILURE_DESIGN_REJECTED'].includes(row.reason.code));
   if(unexpected)throw unexpected.reason;
-  const writers=settled.flatMap(row=>row.status==='fulfilled'&&row.value.providerTimeout?[{id:row.value.id,kind:row.value.providerTimeout}]:[]);
-  const candidates=settled.flatMap(row=>row.status==='fulfilled'&&!row.value.providerTimeout?[row.value]:[]);
+  const writers=settled.flatMap(row=>row.status==='fulfilled'&&(row.value.providerTimeout||row.value.unavailable)?[{id:row.value.id,kind:row.value.providerTimeout??row.value.unavailable}]:[]);
+  const candidates=settled.flatMap(row=>row.status==='fulfilled'&&!row.value.providerTimeout&&!row.value.unavailable?[row.value]:[]);
   if(candidates.length){
    const unique=[...new Map(candidates.map(candidate=>[candidate.instruction,candidate])).values()];
    await save(registry,{identity,candidates:unique});return unique;
   }
   const infra=failures.find(row=>row.reason.code==='FAILURE_DESIGN_INFRASTRUCTURE');
+  if(infra&&panel)throw infra.reason;
   if(infra){const result={status:'infrastructure',infrastructure:true,correct:null,reason:infra.reason.message};await save(dispositionFile,{identity,...result});return result;}
   if(writers.length){
-   const result={status:'infrastructure',infrastructure:true,correct:null,errorCode:'FAILURE_DESIGN_PROVIDER_TIMEOUT',reason:'Instruction writer provider request timed out',writers};
+   const onlyTimeouts=settled.every(row=>row.status==='fulfilled'&&row.value.providerTimeout);
+   const result={status:'infrastructure',infrastructure:true,correct:null,errorCode:onlyTimeouts?'FAILURE_DESIGN_PROVIDER_TIMEOUT':'FAILURE_DESIGN_UNAVAILABLE',reason:onlyTimeouts?'Instruction writer provider request timed out':'No writer produced a review-approved instruction',writers};
    await save(dispositionFile,{identity,...result});return result;
   }
   if(failures.length){const feedback=failures.map(row=>row.reason.revisionFeedback).filter(Boolean);const result={status:'rejected',reason:failures[0].reason.message,...(focused&&!input.revisionFeedback&&feedback.length?{revisionFeedback:feedback.join('\n')}: {})};await save(dispositionFile,{identity,...result});return result;}
   throw Error('Design completed without a lane disposition');
  };
  design.canResume=async op=>{
-  if(!await load(join(op.directory,'design-input.json')))return false;
-  for(const id of ['principle-a','principle-b','principle-c']){
-   const lane=join(op.directory,id),spend=await load(join(lane,'writer-spend.json'));
-   if(!spend||spend.running!==false)return false;
-   if(!await load(join(lane,'writer-result.json'))){
+  const input=await load(join(op.directory,'design-input.json'));
+  if(!input)return false;
+  const ids=['principle-a','principle-b','principle-c'];
+  if(input.qaPolicy==='panel'&&!ids.includes(input.reviewCandidate))return false;
+  for(const id of input.qaPolicy==='panel'?[input.reviewCandidate]:ids){
+   const lane=join(op.directory,id),spend=await load(join(lane,'writer-spend.json')),draft=await load(join(lane,'writer-result.json'));
+   if(spend?spend.running!==false:!(input.frozenQaSha256&&draft))return false;
+   if(!draft){
     const termination=await load(join(lane,'writer','termination.json'));
-    if(!['elapsed','provider-error','cancelled','submitted'].includes(termination?.kind))return false;
+    if(!['elapsed','provider-error','cancelled','submitted',...unsubmittedKinds].includes(termination?.kind))return false;
    }
    for(const name of ['qa.json','qa-v2.json']){
     const qa=await load(join(lane,'qa',name));
