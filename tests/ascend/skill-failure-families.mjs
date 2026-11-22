@@ -122,14 +122,27 @@ test('a different device failure after an edit is not a reproduced or repaired o
 
 
 test('source-history Git metadata is materialized for read-only native research',async t=>{
- const f=await fixture(t),repo=join(f.root,'work');await mkdir(repo);execFileSync('git',['init','-q',repo]);await writeFile(join(repo,'kernel.py'),f.code);execFileSync('git',['-C',repo,'add','kernel.py']);execFileSync('git',['-C',repo,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','retained']);const tree=execFileSync('git',['-C',repo,'rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim();
+ const f=await fixture(t),repo=join(f.root,'work');await mkdir(repo);execFileSync('git',['init','-q',repo]);await writeFile(join(repo,'kernel.py'),f.code);await writeFile(join(repo,'check_helpers.py'),'COUNT=7\n');execFileSync('git',['-C',repo,'add','kernel.py','check_helpers.py']);execFileSync('git',['-C',repo,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','retained']);const tree=execFileSync('git',['-C',repo,'rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim();
  const history=join(f.root,'source-history/retained');await mkdir(join(f.root,'source-history'));execFileSync('git',['clone','--bare','-q',repo,history]);execFileSync('git',['--git-dir',history,'config','core.bare','false']);
+ const investigation=join(f.root,'attempts',f.attempt.id,'investigation');
+ for(const name of ['good','bad','undeclared']){await mkdir(join(investigation,name),{recursive:true});await writeFile(join(investigation,name,'candidate.py'),name);}
+ await writeFile(join(investigation,'check.py'),'assert True');
+ await symlink(join(f.root,'retained.py'),join(investigation,'good','outside'));
+ const proposal=emit(f.state,f.attempt.id,'curriculum-proposal',{proposal:{verifier:'check.py',controls:{positive:'good',negative:['bad','../../outside']}}});
  const snapshot=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),event=emit(f.state,f.attempt.id,'verification',{actor_elapsed:60,fingerprint:await fingerprint(repo),correctness:{passed:false}}),reference='events:'+event.sequence;f.item.evidence.groups[0].occurrences=[{reference}];
  const rows=await failureSourceInventory({...f,directory:join(f.root,'source-index')});const recovered=rows.find(r=>r.reference===reference&&r.source.snapshotReference);assert.ok(recovered);assert.equal(await readFile(recovered.path,'utf8'),f.code);assert.equal(recovered.source.snapshotReference,'events:'+snapshot.sequence);assert.equal(recovered.source.repository,'source-history/retained');
  const isolated=await mkdtemp(join(tmpdir(),'isolated-family-'));t.after(()=>rm(isolated,{recursive:true,force:true}));
  const result=await prepareFailureFamily({...f,directory:isolated,seconds:30},{session:async options=>{
   const {directory,writableDirectory,prompt}=options;
   const source=prompt.sourceInventory.find(row=>row.reference===reference);
+  const inputs=Object.fromEntries(source.replayInputs.map(file=>[file.name,file]));
+  assert.deepEqual(Object.keys(inputs).sort(),['bad/candidate.py','check.py','check_helpers.py','good/candidate.py']);
+  assert.equal(inputs['check_helpers.py'].tree,tree);
+  assert.equal(await readFile(inputs['check_helpers.py'].path,'utf8'),'COUNT=7\n');
+  assert.equal(inputs['check.py'].declaration,'events:'+proposal.sequence);
+  assert.equal(inputs['good/candidate.py'].role,'positive-control');
+  assert.equal(inputs['bad/candidate.py'].role,'negative-control');
+  assert.ok(source.replayInputs.every(input=>options.allowedPaths.includes(input.path)));
   const resultSchema=Type.Unknown();
   await mkdir(directory,{recursive:true});
   await writeFile(join(directory,'review-contract.json'),JSON.stringify({version:REVIEW_CONTRACT_VERSION,schema:resultSchema,writableDirectory}));

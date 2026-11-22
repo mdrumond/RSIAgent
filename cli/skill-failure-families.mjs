@@ -1,6 +1,6 @@
 /** Protected replay families, derived from observed campaign failures before instruction writing. */
 import {setTimeout as delay} from 'node:timers/promises';
-import {readFile,writeFile,mkdir,realpath,stat,rename,readdir} from 'node:fs/promises';
+import {readFile,writeFile,mkdir,realpath,stat,rename,readdir,opendir} from 'node:fs/promises';
 import {dirname,resolve,join,relative,isAbsolute} from 'node:path';
 import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
@@ -49,10 +49,11 @@ async function verificationKernelHashes(root,data){
 }
 // The controller fingerprints all source files, not merely the most recent stage snapshot.
 const treeFingerprints=new Map();
+const fingerprintedFile=name=>!name.split('/').some(p=>['.git','node_modules','__pycache__','.pytest_cache'].includes(p));
 async function treeFingerprint(repository,tree,signal){
  signal?.throwIfAborted();
  const key=repository+'\0'+tree;if(treeFingerprints.has(key))return treeFingerprints.get(key);
- const records=(await gitRead(repository,['ls-tree','-rz',tree],signal)).split('\0').filter(Boolean).map(line=>{const tab=line.indexOf('\t');return {mode:line.slice(0,6),path:line.slice(tab+1)};}).filter(r=>!r.path.split('/').some(p=>['.git','node_modules','__pycache__','.pytest_cache'].includes(p)));
+ const records=(await gitRead(repository,['ls-tree','-rz',tree],signal)).split('\0').filter(Boolean).map(line=>{const tab=line.indexOf('\t');return {mode:line.slice(0,6),path:line.slice(tab+1)};}).filter(r=>fingerprintedFile(r.path));
  if(records.length>128||records.some(r=>!['100644','100755'].includes(r.mode)))return null;
  records.sort((a,b)=>{const left=a.path.split('/'),right=b.path.split('/');for(let i=0;i<Math.min(left.length,right.length);i++)if(left[i]!==right[i])return left[i]<right[i]?-1:1;return left.length-right.length;});
  const hash=createHash('sha256');let size=0;for(const r of records){signal?.throwIfAborted();const code=await gitRead(repository,['show',tree+':'+r.path],signal,true);size+=Buffer.byteLength(code);if(size>8388608)return null;hash.update(JSON.stringify([r.path,sha(code)])+'\n');}
@@ -88,6 +89,65 @@ export async function failureWitness({config,item,provenance,signal}){
  }finally{db.close();}
 }
 
+// These inputs explain the historical check. Qualification still runs the authored controls.
+async function isolationInputs({root,db,attempt,row,source,directory,signal}){
+ const files=[],seen=new Set();let bytes=0;
+ async function retain(name,role,content,provenance){
+  if(bytes+content.length>8388608||files.length>=128)return;
+  let code;try{code=new TextDecoder('utf-8',{fatal:true}).decode(content);}catch{return;}
+  if(!code.trim()||code.includes('\0'))return;
+  const digest=sha(content),path=join(directory,digest+'.txt');
+  await writeFile(path,content);bytes+=content.length;files.push({name,role,path,sha256:digest,...provenance});
+ }
+ // A matching kernel hash by itself cannot vouch for helper files from a different revision.
+ const tree=source.tree,expected=JSON.parse(row.data).fingerprint;
+ if(tree&&hex(expected)){
+  const repository=await scoped(root,source.repository);
+  if(await treeFingerprint(repository,tree,signal)===expected){
+   const names=(await gitRead(repository,['ls-tree','-rz','--name-only',tree],signal)).split('\0').filter(Boolean);
+   for(const name of names){
+    signal?.throwIfAborted();
+    if(name!==source.file&&fingerprintedFile(name)&&files.length<128&&bytes<8388608)await retain(name,'verified-source-dependency',await gitRead(repository,['show',tree+':'+name],signal,true),{tree});
+   }
+  }
+ }
+ const record=db.prepare("SELECT sequence,data FROM events WHERE attempt=? AND type='curriculum-proposal' AND sequence<? ORDER BY sequence DESC LIMIT 1").get(attempt.id,row.sequence);
+ if(record){
+  const proposal=JSON.parse(record.data).proposal,base=resolve(root,'attempts',attempt.id,'investigation');
+  // The controller accepted this proposal after checking its declared sibling fixture directories.
+  if(inside(root,base)&&await realpath(base).catch(()=>null)===base&&proposal){
+   const provenance={declaration:'events:'+record.sequence};
+   const readArchived=async(name,role)=>{
+    signal?.throwIfAborted();
+    const path=resolve(base,name);
+    if(!inside(base,path)||seen.has(path)||await realpath(path).catch(()=>null)!==path)return;
+    seen.add(path);const info=await stat(path);
+    if(info.isFile()&&info.size<=1048576&&bytes+info.size<=8388608)
+     await retain(name,role,await readFile(path),provenance);
+   };
+   if(text(proposal.verifier)&&!isAbsolute(proposal.verifier))await readArchived(proposal.verifier,'verifier');
+   const controls=proposal.controls??{},fixtures=[[controls.positive,'positive-control'],...(Array.isArray(controls.negative)?controls.negative.slice(0,8):[]).map(name=>[name,'negative-control'])];
+   let inspected=0;
+   async function visit(name,role){
+    const path=resolve(base,name);
+    if(await realpath(path).catch(()=>null)!==path)return;
+    const info=await stat(path);if(!info.isDirectory())return;
+    const dir=await opendir(path);
+    for await(const entry of dir){
+     signal?.throwIfAborted();
+     if(++inspected>512||files.length>=128||bytes>=8388608)break;
+     if(entry.name.startsWith('.')||['__pycache__','node_modules'].includes(entry.name))continue;
+     const child=join(name,entry.name);
+     if(entry.isDirectory())await visit(child,role);
+     else if(entry.isFile())await readArchived(child,role);
+    }
+   }
+   for(const [name,role] of fixtures)if(text(name)&&name!=='.'&&name!=='..'&&name!=='source'&&dirname(name)==='.')await visit(name,role);
+  }
+ }
+ return files;
+}
+
 /** Materialize retained Git objects for native read tools; no model needs to decode Git. */
 export async function failureSourceInventory({config,item,directory,signal}){
  const root=await realpath(config.project_evidence_root??config.root),db=new DatabaseSync(join(root,'state.sqlite'),{readOnly:true}),candidates=[];
@@ -112,6 +172,10 @@ export async function failureSourceInventory({config,item,directory,signal}){
     }
     if(sources.some(s=>s.reference===reference))break;
    }
+  }
+  for(const entry of sources){
+   const {attempt,row}=candidates.find(c=>c.reference===entry.reference);
+   entry.replayInputs=await isolationInputs({root,db,attempt,row,source:entry.source,directory,signal});
   }
   await save(join(directory,'sources.json'),sources);return sources;
  }finally{db.close();}
@@ -168,7 +232,7 @@ const resultSchema=target=>Type.Union([
 ]);
 function authorInstructions(focusedCalibration){
  return [
-  'Use native write/edit to assemble the file-backed draft under draftDirectory. Call submit_review with status ready, the typed manifest and evidence claims to run syntax and trusted target checks. The controller replays the development starter first. The tool returns rejected fields and observed control outcomes so you can revise and resubmit. Use the saved draft if one is present.',
+  'Inspect the relevant replayInputs in sourceInventory with native read. Their roles and provenance identify retained checker dependencies and declared historical controls; use trusted qualification to establish their behavior. Use native write/edit to assemble the file-backed draft under draftDirectory. Call submit_review with status ready, the typed manifest and evidence claims to run syntax and trusted target checks. The controller replays the development starter first. The tool returns rejected fields and observed control outcomes so you can revise and resubmit. Use the saved draft if one is present.',
   'Answer the focused question for one retained actor correctness failure. Cite the original verification or primary diagnostic. Inspect successful projects and KDB memory for a passing reference. Preserve the verifier’s input placement and invocation or explain isolation edits using evidence. Attribute behaviour only where a check directly establishes it.',
   'Freeze one development task and two transfer tasks with meaningful, distinct layout, operation, dtype, or boundary adaptations. Use paths relative to draftDirectory and separate the public and private checkers. Keep private helpers out of editable files. Include a passing reference and failing negative controls for each task. Skill writing starts after the family is established.'+
    (focusedCalibration?' Include a distinct passing calibration for every task that exercises the same oracle without using the failing construct.':''),
@@ -293,7 +357,7 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
      task:'Continue the current question from the saved draft and trusted checker feedback. Prior dialogue is unavailable.',
      trustedChecker:lastChecked?{reason:lastChecked.reason,diagnostics:observations[lastChecked.reference]??[]}:null
     }:null;
-    result=await session({directory:research,config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.map(source=>source.path)],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target),
+    result=await session({directory:research,config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.flatMap(source=>[source.path,...source.replayInputs.map(input=>input.path)])],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target),
    onModelTiming:(kind,seconds)=>{timings[kind]+=seconds;},
    prompt:{...(authorRecovery?{recovery:authorRecovery}:{}),target:config.target,draftDirectory:draft,focusedQuestion:{number:question.number,prompt:nextQuestion},task:authorInstructions(focusedCalibration),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
    validate:async value=>{
