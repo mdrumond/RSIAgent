@@ -14,17 +14,25 @@ export function memorySettings(input) {
     throw Error('Ordered positive local memory thresholds required');
   return settings;
 }
-export function memoryDecision(previous,{rssBytes,now,maximum},settings=memoryDefaults) {
+export function memoryDecision(previous,{rssBytes,processCount,now,maximum},settings=memoryDefaults) {
   if(!Number.isSafeInteger(rssBytes)||rssBytes<0||!Number.isFinite(now)||!Number.isSafeInteger(maximum)||maximum<1)
     throw Error('Measured memory, clock and worker limit required');
   const state={...previous,limit:Math.min(previous?.limit??maximum,maximum)};
-  if(rssBytes>=settings.hardBytes)return {...state,action:'emergency',blocked:true};
+  if(rssBytes>=settings.hardBytes)return {...state,lowSince:null,action:'emergency',blocked:true};
   if(state.token) {
     state.lowSince=rssBytes<settings.lowBytes?(state.lowSince??now):null;
     return {...state,action:state.lowSince!==null&&now-state.lowSince>=settings.coolMs?'resume':'cooling',blocked:true};
   }
   const newlyHigh=state.highSince==null;
-  if(rssBytes<settings.softBytes)return {...state,highSince:null,lastReduction:null,blocked:false,action:'run'};
+  if(rssBytes<settings.softBytes){
+    const freshLow=Number.isSafeInteger(processCount)&&processCount>0&&rssBytes<settings.lowBytes&&!state.resumePending;
+    state.lowSince=freshLow?(state.lowSince??now):null;
+    if(state.limit<maximum&&state.lowSince!==null&&now-state.lowSince>=settings.coolMs){
+      state.limit++;state.lowSince=now;
+    }
+    return {...state,highSince:null,lastReduction:null,blocked:false,action:'run'};
+  }
+  state.lowSince=null;
   state.highSince??=now;
   if(newlyHigh||now-(state.lastReduction??now)>=settings.reduceMs) {
     state.limit=Math.max(1,state.limit-1);state.lastReduction=now;
@@ -56,6 +64,7 @@ export async function releaseKnowledgeService(config,{timeoutMs=((config.pause_g
   let service;
   try{service=JSON.parse(await readFile(join(config.root,'knowledge-service.json'),'utf8'));}
   catch(error){if(error.code==='ENOENT')return;throw error;}
+  if(service.ownership==='borrowed')return;
   if(!service.owner?.start||!service.owner?.boot)throw Error('Knowledge service ownership unknown');
   if(await ownerStopped(service.owner))return;
   try {
@@ -78,8 +87,9 @@ export async function sampleCampaignMemory(config,owner,{proc='/proc',known=new 
     for(const row of state.db.prepare('SELECT owner FROM attempts WHERE owner IS NOT NULL').all())add(row.owner,'worker');
     if(state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='requests'").get())for(const row of state.db.prepare("SELECT owner FROM requests WHERE owner IS NOT NULL AND status IN ('queued','running')").all())add(row.owner,'request');
   });
-  try{const service=JSON.parse(await readFile(join(config.root,'knowledge-service.json'),'utf8'));
-    if(service.owner?.boot===owner.boot)roots.set(service.owner.pid,{...service.owner,role:'knowledge'});
+  for(const [file,role]of [['knowledge-service.json','knowledge'],['device-cleanup-service.json','device-cleanup']])try{
+    const service=JSON.parse(await readFile(join(config.root,file),'utf8'));
+    if(service.ownership!=='borrowed'&&service.owner?.boot===owner.boot)roots.set(service.owner.pid,{...service.owner,role});
   }catch(error){if(error.code!=='ENOENT')throw error;}
   const rows=new Map();
   await Promise.all((await readdir(proc)).filter(name=>/^\d+$/.test(name)).map(async name=>{

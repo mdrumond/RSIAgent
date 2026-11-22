@@ -1,3 +1,4 @@
+import {loadSkillEvaluation} from './skill-evaluation-contract.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { cp, mkdir, readFile, writeFile, realpath, stat, rename, rm } from 'node:fs/promises';
 import { join, resolve, relative, sep } from 'node:path';
@@ -216,6 +217,8 @@ export async function upgrade(root,machinery) {
   const staged=join(root,'machinery-next-'+randomUUID());
   async function stoppedOwners() {
     await assertPackAvailable(ledger);
+    if(await (await import('../integrations/environments/device-cleanup.mjs')).campaignCleanupPending(root))
+      throw new Error('Stop active device cleanup writers before upgrading');
     if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()) {
       for(const row of ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer','supervisor-owner')").all()) {
         const owner=JSON.parse(row.value);
@@ -240,7 +243,7 @@ export async function upgrade(root,machinery) {
     const module=pending.length?await import(pathToFileURL(plugin)):null;
     for(const attempt of pending) {
       const environment=await module.createEnvironment({...config.environment.options,localExecution:config.local_execution},{
-        instancePath:join(root,'attempts',attempt.id),event:async()=>{},exclude:async(_label,fn)=>fn()});
+        instancePath:join(root,'attempts',attempt.id),activateCleanup:false,event:async()=>{},exclude:async(_label,fn)=>fn()});
       const safe=environment.canUpgrade
         ? await environment.canUpgrade({attempt,events:ledger.events(attempt.id)})
         : await attemptStopped(ledger,attempt,environment);
@@ -281,7 +284,7 @@ async function importProjectFiles(root,spec,{continuing=false,signal,localExecut
   if(!spec.source || !spec.goal || !(spec.actor_seconds>0) || typeof spec.verifier?.command!=='string' || !spec.verifier.files?.length)
     throw new Error('Project requires goal, source folder, elapsed allocation and frozen verifier command/files');
   if(!/^[a-zA-Z0-9_-]+$/.test(spec.id))throw new Error('Project id must be a folder-safe identifier');
-  signal?.throwIfAborted();await checkBundle(spec);
+  signal?.throwIfAborted();await checkBundle(spec);await loadSkillEvaluation(spec,{required:spec.generation?.learningRequest?.workKind==='suite'});
   const source=await realpath(spec.source),files=spec.verifier.files;
   const hash=path=>fileDigest(path,{signal});
   const expected={};

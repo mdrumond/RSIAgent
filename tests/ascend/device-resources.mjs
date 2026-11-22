@@ -13,7 +13,9 @@ import { State } from '../../controller/state.mjs';
 import { ActorClock } from '../../controller/budget.mjs';
 import { attemptStopped, processIdentity } from '../../controller/lifecycle.mjs';
 import { createEnvironment } from '../../integrations/environments/ascend.mjs';
-import {reserveDevice} from '../../integrations/environments/device-leases.mjs';
+import {queueDeviceCleanup,drainDeviceCleanup,cleanupStatus,cleanupDirectory} from '../../integrations/environments/device-cleanup.mjs';
+import {reserveDevice,closedDeviceLease,closeDeviceLease} from '../../integrations/environments/device-leases.mjs';
+import {admitLearning,learningAdmissionSettled} from '../../cli/learning-admission.mjs';
 
 // Real foundation parser runs against a CPU npu-smi wire-format fixture. No NPU evidence.
 async function fixture(t, health = {}) {
@@ -40,7 +42,7 @@ print(outputs[query])
 `, { mode: 0o700 });
   const calls = [], events = [], commands = [], jobs = new Map(), admissions=new Map();
   let runWorkload = false, onSync = async () => {}, running = false, queued = 0;
-  let waitSignal;
+  let waitSignal,releaseProof,transformAdmission;
   let enabled = [0,1,2,3], disconnect = false, sequence = 0, clockSkew = 0, hideSubmission = false, lastProbe;
   const client = async (args,{signal}={}) => {
     calls.push(args);
@@ -48,7 +50,7 @@ print(outputs[query])
     if (args[0] === 'capabilities') return { state: 'available' };
     if (args[0] === 'preflight') return { state: 'completed' };
     if (args[0] === 'upload') return { state: 'completed' };
-    if (args[0] === 'download') { await writeFile(args[3], admissions.get(args[2]) ?? [...admissions].find(([key])=>key.endsWith('/'+args[2]))?.[1] ?? ''); return { state: 'completed' }; }
+    if (args[0] === 'download') { let value=admissions.get(args[2]) ?? [...admissions].find(([key])=>key.endsWith('/'+args[2]))?.[1] ?? ''; if(value&&transformAdmission&&args[2].endsWith('/admission.json'))value=JSON.stringify(transformAdmission(JSON.parse(value))); await writeFile(args[3],value); return { state: 'completed' }; }
     if (args[0] === 'run') {
       const handle = `remote:fixture:job:${++sequence}`, file = args[args.indexOf('--file')+1];
       let content = '';
@@ -64,7 +66,7 @@ print(outputs[query])
         const config = JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
         const inner=JSON.parse(config.command.slice(config.command.lastIndexOf(" '{")+2,-1).replaceAll("'\\''","'"));
         if(inner.source)commands.push({devices:inner.devices,env:config.env});
-        let admission={token:inner.lease.token,decision:inner.source?'admitted':'reconciled'};
+        let admission={token:inner.lease.token,decision:inner.source?'admitted':'reconciled',...(inner.source&&releaseProof!==undefined?{released:releaseProof}:{})};
         if(runWorkload){
           const receipt=join(instancePath,'host-admission-'+sequence);
           try { await promisify(execFile)('bash',['-c',config.command],{env:{...process.env,...config.env,RSI_LEASE_RECEIPT:receipt,PATH:bin+':'+process.env.PATH,ASCEND_TEST_TELEMETRY:telemetry}}); }
@@ -87,15 +89,32 @@ print(outputs[query])
   };
   const context = { instancePath, leaseDirectory: join(instancePath,'leases'), client, sdk: { createLocalBashOperations: () => ({}) },
     event: async (type,data) => events.push({ type,...data }), exclude: async (_,fn) => fn() };
-  const options = { mode: 'cpl', target: 'fixture', runtime: 'registered', instructionFile,
+  const options = { asyncCleanup:false,mode: 'cpl', target: 'fixture', runtime: 'registered', instructionFile,
     workspacePath: instancePath, remoteDirectory: 'owned', pollMs: 0, probeSeconds: 3,
     health: { product: 'a5', chip: null, query_timeout_seconds: .1, ...health } };
   const environment = await createEnvironment(options, context);
   return { environment, options, context, source, calls, events, commands, rows, telemetry,
-    setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; }, hideSubmission:value=>{hideSubmission=value;}, lastProbe:()=>lastProbe,
+    transformAdmission:fn=>{transformAdmission=fn;},setReleaseProof:value=>{releaseProof=value;}, setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; }, hideSubmission:value=>{hideSubmission=value;}, lastProbe:()=>lastProbe,
     queued:value=>{queued=value;}, wait:fn=>{waitSignal=fn;},runWorkload: () => {runWorkload=true;}, onSync: fn => {onSync=fn;}, running: value => {running=value;},
     update: () => writeFile(telemetry, JSON.stringify(rows)) };
 }
+
+test('learning admission uses real health/parser and leases before any payload dispatch',async t=>{
+ const f=await fixture(t,{product:'a3',chip:0});f.setEnabled([0]);
+ const pool=f.context.instancePath,held=await reserveDevice(pool,0,f.context.leaseDirectory,{instancePath:join(pool,'old-pilot')});
+ const input={directory:join(pool,'learning-admission'),config:{root:pool,target:'a3',environment:{options:f.options}},request:{learningTarget:'device'},resource:{id:'background',metadata:{pool}}};
+ const deps={leaseDirectory:f.context.leaseDirectory,createEnvironment:(options,context)=>createEnvironment(options,{...context,client:f.context.client,leaseDirectory:f.context.leaseDirectory})};
+ const bytes=await readFile(held.receipt,'utf8');
+ const blocked=await admitLearning(input,deps);assert.equal(blocked.admitted,false);assert.equal(blocked.reason,'device-reservation-unresolved');assert.equal(await readFile(held.receipt,'utf8'),bytes);
+ assert.equal(await learningAdmissionSettled(input,deps),true);
+ assert(f.calls.some(args=>args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('probe.sh')));
+ assert(!f.calls.some(args=>args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')));
+ await held.release();const admitted=await admitLearning(input,deps);assert.equal(admitted.admitted,true);assert.equal(admitted.physicalDevice,0);
+ f.hideSubmission(true);const unknown=await admitLearning(input,deps);assert.equal(unknown.closed,false);assert.equal(unknown.admitted,false);
+ const runs=f.calls.filter(args=>args[0]==='run').length,probe=f.lastProbe();
+ f.hideSubmission(false);await writeFile(probe.receipt,JSON.stringify({handle:probe.handle}));
+ assert.equal(await learningAdmissionSettled(input,deps),true);assert.equal(f.calls.filter(args=>args[0]==='run').length,runs,'Closure must observe the original probe, not submit another');
+});
 
 for(const failure of ['closed','closed-at-stop','not-admitted','unknown'])test(`health setup proof: ${failure}`,async t=>{
   const f=await fixture(t),reason={stage:'ssh_preflight',message:'open failed'};
@@ -601,7 +620,14 @@ test('legacy reservation with no owner proof reports actionable blockage without
   const f=await fixture(t);f.setEnabled([0]);
   const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);await held.update({owner:null});
   await f.environment.prepare({project:{source:f.source},attempt:{id:'new'}});
-  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>error.code==='DEVICE_LEASE_BLOCKED');
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>{
+    assert.equal(error.code,'DEVICE_LEASE_BLOCKED');
+    assert.equal(error.reservations[0].receipt,held.receipt);
+    assert.equal(error.reservations[0].token,held.token);
+    assert.equal(error.reservations[0].physicalDevice,0);
+    assert.equal(error.reservations[0].reason,'owner-unknown');
+    return true;
+  });
   const blocked=f.events.find(e=>e.type==='device-lease-blocked');
   assert.equal(blocked.reservations[0].receipt,held.receipt);assert.equal(blocked.reservations[0].reason,'owner-unknown');
   assert.equal(f.events.filter(e=>e.type==='device-lease-acquired').length,0);
@@ -631,6 +657,62 @@ test('reclaimed token closure lets its original checkpoint resume without touchi
   assert.equal(JSON.parse(await readFile(fresh.receipt,'utf8')).token,fresh.token);
 });
 
+test('a retained displaced receipt closes its original fence without replacing the active reservation',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const old=await reserveDevice(f.context.instancePath,0,join(f.context.instancePath,'quarantined'));
+  await old.update({owner:{...old.record.owner,start:'old-process'},handles:['remote:fixture:job:old-payload']});
+  const artifact={submission:'missing-output-download',kind:'download',accountingExcluded:true,receiptFile:null};
+  await old.event('execution-submitting',artifact);
+  const active=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  const before=await readFile(active.receipt,'utf8');
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
+  assert.equal(result.closed,true);
+  assert.deepEqual(result.unresolvedArtifacts,[artifact]);
+  assert.equal(await readFile(active.receipt,'utf8'),before);
+  await assert.rejects(readFile(old.receipt),{code:'ENOENT'});
+  assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]==='remote:fixture:job:old-payload'));
+  assert.equal(f.commands.length,0,'only token-scoped cleanup runs, never an actor payload');
+  const calls=f.calls.length;
+  assert.deepEqual(await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token}),result);
+  assert.equal(f.calls.length,calls,'retrying a known closure performs no client work');
+  assert.equal(await readFile(active.receipt,'utf8'),before);
+});
+
+for(const mismatch of ['pool','physical'])test(`an archived retained closure with a different ${mismatch} cannot satisfy a recovery retry`,async t=>{
+  const f=await fixture(t);
+  const old=await reserveDevice(mismatch==='pool'?'another-pool':f.context.instancePath,mismatch==='physical'?2:0,join(f.context.instancePath,'quarantined'));
+  await closeDeviceLease(old);
+  await f.environment.resources();
+  const calls=f.calls.length;
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
+  assert.equal(result.closed,false);assert.equal(result.reason,'ownership-changed');
+  assert.equal(f.calls.length,calls);
+});
+
+for(const mismatch of ['pool','physical','token'])test(`retained reservation ${mismatch} mismatch cannot dispatch cleanup`,async t=>{
+  const f=await fixture(t);
+  const old=await reserveDevice(mismatch==='pool'?'another-pool':f.context.instancePath,mismatch==='physical'?2:0,join(f.context.instancePath,'quarantined'));
+  await old.update({owner:{...old.record.owner,start:'old-process'}});
+  const before=await readFile(old.receipt,'utf8');
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:mismatch==='token'?'another-token':old.token});
+  assert.equal(result.closed,false);assert.equal(result.reason,'ownership-changed');
+  assert.equal(await readFile(old.receipt,'utf8'),before);
+  assert.equal(f.calls.filter(a=>a[0]!=='npu').length,0);
+});
+
+for(const blocked of ['live-owner','unknown-submission'])test(`retained reservation preserves ${blocked} closure guard`,async t=>{
+  const f=await fixture(t),old=await reserveDevice(f.context.instancePath,0,join(f.context.instancePath,'quarantined'));
+  if(blocked==='unknown-submission'){
+    await old.update({owner:{...old.record.owner,start:'old-process'}});
+    await old.event('execution-submitting',{submission:'unknown-original',kind:'run'});
+  }
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
+  assert.equal(result.closed,false);
+  assert.equal(result.reason,blocked==='live-owner'?'owner-active':'submission-unknown');
+  assert.equal(JSON.parse(await readFile(old.receipt,'utf8')).token,old.token);
+  assert.equal(f.calls.filter(a=>a[0]!=='npu').length,0);
+});
+
 for(const unknown of [false,true])test(`failed control admission download (${unknown?'unknown':'closed'} transfer) retains its native handle without replay`,async t=>{
   const f=await fixture(t);let broken=true,controlHandle;
   const client=async(args,settings)=>{
@@ -655,10 +737,12 @@ for(const unknown of [false,true])test(`failed control admission download (${unk
     migrateClosedControl:async()=>{migrated=true;return true;}})).closed,false);
   assert.equal(migrated,false,'an existing native journal is not a legacy migration');
   assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
+  const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
   broken=false;const recovered=await restarted.reconcileLease();
-  assert.equal(recovered,!unknown);
-  if(unknown){const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
-    assert.equal(JSON.parse(await readFile(pointer.receipt,'utf8')).controlHandle,controlHandle);}
+  assert.equal(recovered,true);
+  if(unknown){const proof=await closedDeviceLease(pointer.receipt,pointer.token);
+    assert.ok(proof.unresolvedArtifacts.some(row=>row.kind==='download'&&!row.handle));
+    assert.equal(JSON.parse(await readFile(join(proof.path,'lease.json'),'utf8')).controlHandle,controlHandle);}
   assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
 });
 
@@ -670,6 +754,39 @@ test('control-started with an unknown payload submission is held instead of redi
   assert.equal(await f.environment.reconcileLease(),false);
   assert.equal(f.calls.filter(a=>a[0]==='run').length,0);
   assert.equal(JSON.parse(await readFile(held.receipt,'utf8')).controlStarted,true);
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>{
+    assert.equal(error.code,'RSI_EXECUTION_UNRESOLVED');
+    assert.deepEqual(error.reservations,[{receipt:held.receipt,token:held.token,pool:held.record.pool,physicalDevice:0}]);
+    return true;
+  });
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,0);
+});
+
+test('the original checkpoint can release its device after host closure while preserving an unidentified output transfer',async t=>{
+  const f=await fixture(t),held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  const artifact={submission:'missing-output-download',kind:'download',accountingExcluded:true,receiptFile:null};
+  await held.event('execution-submitting',artifact);
+  await writeFile(join(f.context.instancePath,'.ascend-command-lease.json'),JSON.stringify({receipt:held.receipt,token:held.token,pool:held.record.pool,physicalDevice:0}));
+  assert.equal(await f.environment.reconcileLease(),true);
+  const released=f.events.find(e=>e.type==='device-lease-released');
+  assert.deepEqual(released.unresolvedArtifacts,[artifact]);
+  assert.equal(f.commands.length,0);
+});
+
+test('a dead owner with an unidentified submission exposes its identity without admitting another payload',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  const receiptFile=join(f.context.instancePath,'lost-submission.json');
+  await held.update({owner:{...held.record.owner,start:'old-process'},handles:['remote:fixture:job:terminal']});
+  await held.event('execution-submitting',{submission:'unidentified-command',receiptFile,kind:'run'});
+  await f.environment.prepare({project:{source:f.source},attempt:{id:'new'}});
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>{
+    assert.equal(error.code,'DEVICE_LEASE_BLOCKED');
+    assert.deepEqual(error.reservations,[{physicalDevice:0,closed:false,reason:'submission-unknown',receipt:held.receipt,token:held.token,submission:'unidentified-command',receiptFile}]);
+    return true;
+  });
+  assert.equal(f.commands.length,0);
+  assert.equal(JSON.parse(await readFile(held.receipt,'utf8')).token,held.token);
 });
 
 test('explicit closed legacy-control migration requires an absent journal and native closure',async t=>{
@@ -782,6 +899,9 @@ test('repeated positively failed cleanup stops at elapsed observation allowance 
 for(const stage of ['payload-observe','control-prepare','control-observe','admission-read','upload-parent','transfer'])
 test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains its fence`,async t=>{
   const f=await fixture(t),controls=new Set(),parents=new Set(),receipts=new Set();
+  // Exercise the real CPU health parser before the narrow cleanup clock. Slow
+  // interpreter startup is setup work, not the hung-RPC behavior under test.
+  f.setEnabled([0]);await f.environment.inspectDevices();const healthHandle=f.lastProbe().handle;let reusedHealth=0;
   const heldTransfer='remote:fixture:transfer:held-cleanup-upload';
   let payload,observations=0,aborted=0,blocking=true,freshCancellation=0;
   const {createServer,connect}=await import('node:net'),sockets=new Set();
@@ -798,6 +918,10 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
     });
   };
   const client=async(args,{signal}={})=>{
+    if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('probe.sh')){
+      reusedHealth++;await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify({handle:healthHandle}));
+      return {handle:healthHandle,state:'queued'};
+    }
     if(stage==='upload-parent'&&args[0]==='capabilities'&&f.commands.length)return {state:'available',backend:'ssh'};
     if(blocking&&stage==='transfer'&&args[0]==='upload'&&f.commands.length)
       return {state:'running',handle:heldTransfer};
@@ -825,7 +949,7 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
   const environment=await createEnvironment({...f.options,probeObservationSeconds:1},{...f.context,client});
   await environment.prepare({project:{source:f.source},attempt:{id:'bounded-cleanup'}});
   const start=performance.now(),result=await environment.execute('payload-once',f.source,{timeout:5});
-  assert.equal(result.settled,false);assert.equal(result.exitCode,0);assert.ok(aborted>0);
+  assert.equal(reusedHealth,1);assert.equal(result.settled,false);assert.equal(result.exitCode,0);assert.ok(aborted>0);
   assert.equal(freshCancellation,0,'cleanup cancellation must not start a fresh RPC budget after its deadline');
   assert.ok(performance.now()-start<5000,'a hung cleanup must not receive fresh per-RPC observation windows');
   assert.equal(f.commands.length,1);assert.equal(f.events.some(event=>event.type==='device-lease-released'),false);
@@ -838,7 +962,14 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
   blocking=false;
   if(stage==='admission-read') {
     assert.ok(retained.submissions.some(row=>!row.closed&&!row.handle),'an interrupted unacknowledged transfer remains unknown');
-    assert.equal(await environment.reconcileLease(),false,'transport recovery is not proof that the unacknowledged transfer closed');
+    assert.equal(await environment.reconcileLease(),true,'positive host closure can free the device while the output transfer stays unknown');
+    const proof=await closedDeviceLease(pointer.receipt,pointer.token);
+    assert.ok(proof.unresolvedArtifacts.length>0);
+    const archived=JSON.parse(await readFile(join(proof.path,'lease.json'),'utf8'));
+    for(const artifact of proof.unresolvedArtifacts){
+      const original=archived.submissions.find(row=>row.submission===artifact.submission);
+      assert.equal(original.closed,undefined);assert.equal(original.handle,undefined);
+    }
   } else assert.equal(await environment.reconcileLease(),true,'an expired control context must not poison a later observation');
   assert.equal(f.commands.length,1,'observing late completion must never replay the payload');
 });
@@ -855,4 +986,143 @@ test('admitted actor command receives persistent scratch and runtime cache defau
   assert.equal(JSON.parse(await readFile(paths.RSI_SETUP_REPORT,'utf8')).logical_device,0);
   assert.equal((await bound.execute('test "$(cat "$RSI_SCRATCH_DIR/probe")" = retained',f.source,{timeout:5})).exitCode,0);
   assert.equal(paths.RSI_SCRATCH_DIR.startsWith(f.options.workspacePath),true);
+});
+
+for(const released of [true,false,'true'])test('only a positive released receipt skips remote fence reconciliation: '+released,async t=>{
+ const f=await fixture(t);f.setEnabled([0]);f.setReleaseProof(released);
+ await f.environment.prepare({project:{source:f.source},attempt:{id:'release'}});
+ const result=await f.environment.execute('true',f.source,{timeout:10});assert.equal(result.settled,true);
+ const controls=f.events.filter(e=>e.type==='execution-submitting'&&e.controlPayload);
+ assert.equal(controls.length,released===true?0:1);
+ assert.ok(f.events.some(e=>e.type==='device-lease-released'));
+});
+
+test('released payload evidence cannot close an unresolved owned handle',async t=>{
+ const f=await fixture(t);f.setEnabled([0]);f.setReleaseProof(true);let reconcile=false;
+ const environment=await createEnvironment(f.options,{...f.context,exclude:async(label,fn)=>{const result=await fn();if(label==='admission'&&result?.result?.handle){reconcile=true;f.disconnect(true);}return result;}});
+ await environment.prepare({project:{source:f.source},attempt:{id:'unknown-release'}});
+ const result=await environment.execute('true',f.source,{timeout:10});assert.equal(reconcile,true);assert.equal(result.settled,false);
+ assert.equal(f.events.some(e=>e.type==='device-lease-released'),false);
+ f.disconnect(false);assert.equal(await environment.reconcileLease(),true);
+ assert.equal(f.events.filter(e=>e.type==='execution-submitting'&&e.controlPayload).length,0);
+});
+
+test('a released receipt from another token still requires the existing host reconciliation',async t=>{
+ const f=await fixture(t);f.setEnabled([0]);f.setReleaseProof(true);let reconciling=false;
+ f.transformAdmission(value=>reconciling&&value.released===true?{...value,token:'other-owner'}:value);
+ const environment=await createEnvironment(f.options,{...f.context,exclude:async(label,fn)=>{const result=await fn();if(label==='admission'&&result?.result?.handle)reconciling=true;return result;}});
+ await environment.prepare({project:{source:f.source},attempt:{id:'foreign-release'}});
+ const result=await environment.execute('true',f.source,{timeout:10});assert.equal(result.settled,true);
+ assert.equal(f.events.filter(e=>e.type==='execution-submitting'&&e.controlPayload).length,1);
+ assert.ok(f.events.some(e=>e.type==='device-lease-released'));
+});
+test('health submission survives actor cutoff until its native receipt is retained and stopped',async t=>{
+ const f=await fixture(t),body=new AbortController(),cleanup=AbortSignal.timeout(2000),cancelled=[];let dispatched=0;
+ const environment=await createEnvironment(f.options,{...f.context,signal:body.signal,stopSignal:cleanup,client:async(args,settings)=>{
+  if(args[0]==='run'){dispatched++;body.abort();await delay(30,null,{signal:settings?.signal});}
+  if(args[0]==='cancel'){cancelled.push(args[1]);assert.equal(settings.signal.aborted,false);return {state:'cancelled'};}
+  return f.context.client(args,settings);
+ }});
+ await assert.rejects(environment.inspectDevices());assert.equal(dispatched,1);
+ const submitted=f.events.find(event=>event.type==='execution-submitted'&&event.handle);assert.ok(submitted);assert.deepEqual(cancelled,[submitted.handle]);
+ assert.equal(JSON.parse(await readFile(f.lastProbe().receipt,'utf8')).handle,submitted.handle);
+ assert.ok(f.events.some(event=>event.type==='execution-state'&&event.handle===submitted.handle&&event.state==='stopped'));
+});
+test('public operation reconciliation accepts nonce-bound closed wrapper and releases its exact lease without a native ID',async t=>{
+ const f=await fixture(t);f.setEnabled([0]);f.setReleaseProof(true);let configuration,payloads=0;
+ const environment=await createEnvironment(f.options,{...f.context,client:async(args,settings)=>{
+  if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')){
+   const file=args[args.indexOf('--file')+1],script=await readFile(file,'utf8');configuration=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
+   await f.context.client(args,settings);await rm(args[args.indexOf('--receipt-file')+1]);payloads++;throw Error('Reply lost before native ID persisted');
+  }
+  if(args[0]==='download'&&args[2].endsWith('/timing.json')){await writeFile(args[3],JSON.stringify({completed:true,key:configuration.timingKey,executionSeconds:2.575,outcome:{kind:'command'}}));return {state:'completed'};}
+  if(args[0]==='download'&&args[2].endsWith('/exit')){await writeFile(args[3],'0');return {state:'completed'};}
+  return f.context.client(args,settings);
+ }});
+ await environment.prepare({project:{source:f.source},attempt:{id:'lost-wrapper'}});await assert.rejects(environment.execute('true',f.source,{timeout:10}),/identity unknown/);
+ const retained=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
+ const pending=f.events.find(event=>event.type==='execution-submitting'&&event.receiptFile?.endsWith('/submission.json'));
+ const events=f.events.map(({type,...data})=>({type,data}));const proof=await environment.reconcileOperation({operation:pending.submission,events});
+ assert.equal(proof.closed,true);assert.equal(proof.nativeIdentityMissing,true);assert.equal(proof.artifactsUnresolved,true);assert.equal(proof.executionSeconds,2.575);assert.equal(payloads,1);
+ assert.ok(await closedDeviceLease(retained.receipt,retained.token));assert.ok(f.events.some(event=>event.type==='execution-wrapper-closed'));assert.equal(await environment.reconcileLease(),true);
+});
+test('probe observation cutoff during a dispatched handshake retains its identity through independent cleanup',async t=>{
+ const f=await fixture(t),cleanup=AbortSignal.timeout(2000),cancelled=[];let dispatched=0;
+ const environment=await createEnvironment({...f.options,probeObservationSeconds:.04},{...f.context,stopSignal:cleanup,client:async(args,settings)=>{
+  if(args[0]==='run'){dispatched++;await delay(70,null,{signal:settings?.signal});}
+  if(args[0]==='cancel'){cancelled.push(args[1]);assert.equal(settings.signal.aborted,false);return {state:'cancelled'};}
+  return f.context.client(args,settings);
+ }});
+ await assert.rejects(environment.inspectDevices());assert.equal(dispatched,1);
+ const submitted=f.events.find(event=>event.type==='execution-submitted'&&event.handle);assert.ok(submitted);assert.deepEqual(cancelled,[submitted.handle]);
+ assert.equal(JSON.parse(await readFile(f.lastProbe().receipt,'utf8')).handle,submitted.handle);
+});
+test('probe cutoff during its submission journal prevents dispatch with positive no-admission evidence',async t=>{
+ const f=await fixture(t);let dispatched=0;
+ const environment=await createEnvironment({...f.options,probeObservationSeconds:.02},{...f.context,stopSignal:AbortSignal.timeout(1000),event:async(type,data)=>{
+  await f.context.event(type,data);if(type==='execution-submitting')await delay(40);
+ },client:async(args,settings)=>{if(args[0]==='run')dispatched++;return f.context.client(args,settings);}});
+ await assert.rejects(environment.inspectDevices());assert.equal(dispatched,0);assert.ok(f.events.some(event=>event.type==='execution-not-admitted'));
+});
+for(const cleanup of ['closed','unknown','body-cutoff'])test(`cancelled payload without admission reconciles its exact token before settling: ${cleanup}`,async t=>{
+ const f=await fixture(t),body=new AbortController();f.setEnabled([0]);f.setReleaseProof(true);let payloads=0,controls=0;
+ const cancelled='remote:fixture:job:cancelled-before-admission',control='remote:fixture:job:unknown-cleanup';
+ const environment=await createEnvironment({...f.options,probeObservationSeconds:2},{...f.context,signal:body.signal,stopSignal:AbortSignal.timeout(5000),client:async(args,settings)=>{
+  if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')){
+   const script=await readFile(args[args.indexOf('--file')+1],'utf8'),config=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'")),inner=JSON.parse(config.command.slice(config.command.lastIndexOf(" '{")+2,-1).replaceAll("'\\''","'"));
+   if(inner.source){payloads++;if(payloads===1){if(cleanup==='body-cutoff')body.abort();return {state:'queued',handle:cancelled};}}
+   else{controls++;if(cleanup==='unknown')return {state:'queued',handle:control};}
+  }
+  if(args[0]==='cancel'&&args[1]===cancelled)return {state:'cancelled'};
+  if(args[0]==='observe'&&args[1]===cancelled)return {state:'cancelled',exit:null};
+  if(args[0]==='observe'&&args[1]===control)return {state:'observation-unavailable'};
+  return f.context.client(args,settings);
+ }});
+ await environment.prepare({project:{source:f.source},attempt:{id:'cancelled-no-admission'}});
+ const result=await environment.execute('true',f.source,{timeout:10});
+ assert.equal(result.handle,cancelled);assert.equal(result.settled,cleanup!=='unknown');assert.equal(result.admissionUnknown,true);assert.equal(result.admission,undefined);assert.equal(payloads,1);assert.equal(controls,1);
+ if(cleanup!=='unknown'){
+  assert.equal(result.outcome.kind,'infrastructure');assert.ok(f.events.some(event=>event.type==='device-lease-released'));
+  if(cleanup==='body-cutoff'){await assert.rejects(environment.execute('true',f.source,{timeout:10}));assert.equal(payloads,1);}
+  else{const next=await environment.execute('true',f.source,{timeout:10});assert.equal(next.settled,true);assert.equal(payloads,2);}
+ }else{assert.equal(await environment.reconcileLease(),false);assert.equal(payloads,1);assert.equal(f.events.some(event=>event.type==='device-lease-released'),false);}
+});
+
+test('async cleanup returns known payloads and admits other free devices before token cleanup finishes',async t=>{
+ const f=await fixture(t);f.setEnabled([0,1]);delete f.rows[1].status;await f.update();let ticket,launches=0;
+ const lifecycle=[];const context={...f.context,event:async(type,data)=>{lifecycle.push({type,data:{...data,operation:'actor-target-op'}});await f.context.event(type,data);},cleanupLaunch:async(_directory,key)=>{launches++;ticket=key;return processIdentity();}};
+ const options={...f.options,probeObservationSeconds:3};delete options.asyncCleanup;
+ const environment=await createEnvironment(options,context);
+ await environment.prepare({project:{source:f.source},attempt:{id:'async-actor'}});
+ const first=await environment.execute('true',f.source,{timeout:10});assert.equal(first.settled,true);assert.ok(first.cleanupPending);
+ const second=await environment.execute('true',f.source,{timeout:10});assert.equal(second.settled,true);assert.ok(second.cleanupPending);
+ assert.deepEqual(f.commands.map(command=>command.devices),[[0],[1]]);assert.equal(launches,1);
+ assert.equal(f.events.filter(event=>event.type==='execution-submitting'&&event.purpose==='device-lease-control').length,0);
+ lifecycle.push({type:'execution-settled',data:{operation:'actor-target-op'}});
+ const {operationsStopped}=await import('../../controller/lifecycle.mjs');
+ assert.equal(await operationsStopped({events:()=>lifecycle,queryEvents:()=>[],checkpoint:()=>{}},{id:'actor',elapsed:0},environment),true);
+ const directory=cleanupDirectory(context),pending=await cleanupStatus(directory);assert.equal(pending.length,2);assert.ok(pending.every(row=>row.status==='queued'));
+ const newer={token:'next-command-token',receipt:'next-command-receipt'};await writeFile(join(f.context.instancePath,'.ascend-command-lease.json'),JSON.stringify(newer));
+ let release;const held=new Promise(resolve=>{release=resolve;});let started=0;
+ const draining=drainDeviceCleanup(directory,ticket,{run:async(request,signal)=>{
+  started++;await held;
+  const cleanup=await createEnvironment({...f.options,asyncCleanup:false},{...f.context,cleanupLeasePath:request.pointer,signal,stopSignal:signal,event:async(type,data)=>writeFile(request.journal,JSON.stringify({type,data})+'\n',{flag:'a'})});
+  return cleanup.reconcileLease();
+ }});
+ while(started<2)await delay(5);assert.equal((await cleanupStatus(directory)).filter(row=>row.status==='running').length,2);release();await draining;
+ assert.ok((await cleanupStatus(directory)).every(row=>row.status==='closed'));assert.deepEqual(JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8')),newer);
+ for(const row of pending)assert.ok(await closedDeviceLease(row.request.receipt,row.request.token));
+});
+test('async cleanup never converts an unknown payload into a queued closed command',async t=>{
+ const f=await fixture(t);f.setEnabled([0]);const payloads=new Set();let launches=0;
+ const context={...f.context,cleanupLaunch:async()=>{launches++;return processIdentity();},client:async(args,settings)=>{
+  if(args[0]==='observe'&&payloads.has(args[1]))return {state:'running'};
+  const result=await f.context.client(args,settings);
+  if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh'))payloads.add(result.handle);
+  return result;
+ }};
+ const environment=await createEnvironment({...f.options,asyncCleanup:true},context);await environment.prepare({project:{source:f.source},attempt:{id:'unknown-async'}});
+ const result=await environment.execute('true',f.source,{timeout:.02,stopSignal:AbortSignal.timeout(700)});
+ assert.equal(result.settled,false);assert.equal(result.cleanupPending,undefined);assert.equal(launches,0);assert.deepEqual(await cleanupStatus(cleanupDirectory(context)),[]);
+ assert.ok(JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8')).token);
 });

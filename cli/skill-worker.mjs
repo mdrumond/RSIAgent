@@ -1,11 +1,12 @@
 import * as background from './skill-background.mjs';
+import {skillPromotionPending} from './skill-promotion-gate.mjs';
 
 // The second iteration permanently earmarks one scheduler slot for tuning.
 // Physical commands still use the foreground environment's shared device leases.
 export function skillWorker({control, config, remaining, event, signal, operations=background, now=Date.now}) {
   let running, aborter, nextPoll=0, capacity=0, reservation=false;
   let resource=control.get('skill-background-resource');
-  const enabled=()=>config().skills?.background && (!config().campaign_plan ||
+  const enabled=()=>config().skills?.background && (skillPromotionPending(config()) || !config().campaign_plan ||
     (control.get('campaign-plan')?.index??0)>=2);
   const settled=()=>operations.backgroundSkillsSettled(config());
   return {
@@ -15,13 +16,16 @@ export function skillWorker({control, config, remaining, event, signal, operatio
     get capacity(){return capacity;},
     async poll(resources, active, limit, {admit=true}={}) {
       const current=config();
+      if(!enabled() && resource && !running && await settled()) {
+        resource=null;control.set('skill-background-resource',null);
+      }
       const available=resources.filter(row=>row.available &&
         (!current.resource_ids || current.resource_ids.includes(row.id)));
       const marked=resources.some(row=>row.metadata?.backgroundSlot===true);
       const backgroundAvailable=available.some(row=>row.metadata?.backgroundSlot===true);
       const account=async()=>{
         const unavailable=resource&&!available.some(row=>row.id===resource.id);
-        const occupied=Boolean(running)||(unavailable&&!await settled());
+        const occupied=Boolean(running)||Boolean(resource&&!await settled());
         capacity=Math.min(limit,available.length+(occupied&&unavailable?1:0));
         reservation=Boolean(occupied||(enabled()&&(marked?backgroundAvailable:true)));
       };
@@ -36,8 +40,14 @@ export function skillWorker({control, config, remaining, event, signal, operatio
       if(!resource&&retained) {
         resource=retained;control.set('skill-background-resource',resource);await account();
       }
+      // Keep the earmark while a legacy foreground owner drains. Otherwise its
+      // exit between this poll and foreground selection makes the slot reusable.
+      if(!resource&&marked) {
+        const earmark=available.find(row=>row.metadata?.backgroundSlot===true);
+        if(earmark){resource=earmark;control.set('skill-background-resource',resource);}
+      }
       const selected=available.find(row=>(!marked || row.metadata?.backgroundSlot===true) &&
-        (!retained || row.id===retained.id) && !control.leased(row.id));
+        (!resource || row.id===resource.id) && !control.leased(row.id));
       if(!selected || capacity<1 || active>capacity-1)return;
       resource=selected;control.set('skill-background-resource',resource);
       if(!status.hasWork || remaining()<=0 || !await settled())return;

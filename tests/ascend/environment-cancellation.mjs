@@ -61,7 +61,8 @@ for(const closure of ['completed','unknown'])test(`aborted body recovers run rec
   await f.prepare();const result=await f.environment.execute('python answer.py',f.source,{signal:f.abort.signal});
   assert.equal(result.settled,closure==='completed');assert.equal(workload,1);assert.equal(sync,1);
   const cleanup=f.calls.filter(c=>c.args[1]==='remote:fixture:job:work');
-  assert.deepEqual(cleanup.map(c=>c.args[0]),['cancel','observe']);
+  if(closure==='completed')assert.deepEqual(cleanup.map(c=>c.args[0]),['cancel','observe','logs']);
+  else {assert.equal(cleanup[0].args[0],'cancel');assert.ok(cleanup.slice(1).every(c=>c.args[0]==='observe'));}
   assert.equal(cleanup[0].signal,cleanup[1].signal);
   assert.ok(f.events.some(e=>e.type==='execution-submitted'&&e.data.handle==='remote:fixture:job:work'));
   if(closure==='unknown') {
@@ -153,4 +154,88 @@ for(const state of ['completed','unknown'])test(`initial retained download timeo
   }else{await assert.rejects(f.environment.browse('report.log'),/Transfer unresolved/);assert.equal(f.calls.some(c=>c.args[0]==='fetch'),false);}
   assert.equal(f.calls.filter(c=>c.args[0]==='download').length,1);
   assert.equal(f.calls.filter(c=>c.args[0]==='observe'&&c.args[1]===handle).length,1);
+});
+
+for(const scenario of ['delayed','transient-unknown','never'])test('stop honors its cleanup allowance: '+scenario,async t=>{
+ let cancelledAt,observations=0;
+ const duration=scenario==='delayed'?5200:100;
+ const f=await fixture(t,async(args,signal)=>{
+  if(args[0]==='cancel'){cancelledAt=performance.now();return {state:'cancelling'};}
+  if(args[0]==='observe'){
+   observations++;signal.throwIfAborted();
+   if(scenario!=='never'&&performance.now()-cancelledAt>=duration)return {state:'cancelled'};
+   return {state:scenario==='transient-unknown'?'observation-unavailable':'running'};
+  }
+ });
+ const cleanup=AbortSignal.timeout(scenario==='delayed'?8000:scenario==='never'?150:1000);
+ const started=performance.now(),result=await f.environment.stop('remote:fixture:job:owned',{signal:cleanup});
+ assert.equal(result.state,scenario==='never'?'unknown':'stopped');
+ assert.ok(observations>=2);assert.equal(f.calls.filter(c=>c.args[0]==='cancel').length,1);
+ assert.equal(f.calls.some(c=>c.args[0]==='run'),false);
+ if(scenario==='delayed')assert.ok(performance.now()-started>5000);
+ if(scenario==='never'){assert.equal(cleanup.aborted,true);assert.ok(performance.now()-started<1000);}
+});
+test('actor abort after dispatch retains the delayed native identity before bounded cleanup',async t=>{
+ let payloads=0;const cleanup=new AbortController();t.after(()=>cleanup.abort());
+ const f=await fixture(t,async(args,signal,{abort})=>{
+  if(args[0]==='run'){
+   const command=args[args.indexOf('--file')+1].endsWith('command.sh'),handle='remote:fixture:job:'+(command?'delayed-native':'sync');
+   if(command){payloads++;abort.abort();await delay(35,null,{signal});}
+   await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify({handle}));return {state:'queued',handle};
+  }
+ });
+ f.context.stopSignal=cleanup.signal;await f.prepare();
+ const result=await f.environment.execute('true',f.source,{signal:f.abort.signal,stopSignal:cleanup.signal,timeout:1});
+ assert.equal(result.handle,'remote:fixture:job:delayed-native');assert.equal(result.settled,true);assert.equal(payloads,1);
+ assert.ok(result.executionSeconds>=0.03);
+ const operations=f.calls.filter(call=>call.args[1]===result.handle).map(call=>call.args[0]);assert.deepEqual(operations.slice(0,2),['cancel','observe']);
+ const submission=f.events.find(event=>event.type==='execution-submitted'&&event.data.handle===result.handle);assert.ok(submission);
+ const receipt=f.events.find(event=>event.type==='execution-submitting'&&event.data.submission===submission.data.submission).data.receiptFile;
+ assert.equal(JSON.parse(await readFile(receipt,'utf8')).handle,result.handle);
+});
+test('pre-aborted execution never starts admission despite an independent cleanup allowance',async t=>{
+ const f=await fixture(t);await f.prepare();f.abort.abort();const before=f.calls.length;
+ await assert.rejects(f.environment.execute('true',f.source,{stopSignal:AbortSignal.timeout(1000)}),/cancelled/);
+ assert.equal(f.calls.length,before);
+});
+test('exhausted native receipt allowance keeps a dispatched unknown identity fenced',async t=>{
+ let payloads=0;const f=await fixture(t,async(args,signal,{abort})=>{
+  if(args[0]==='run'){
+   const command=args[args.indexOf('--file')+1].endsWith('command.sh');
+   if(command){payloads++;abort.abort();await delay(1000,null,{signal});return {state:'queued',handle:'remote:fixture:job:too-late'};}
+   return {state:'queued',handle:'remote:fixture:job:sync'};
+  }
+ });
+ await f.prepare();await assert.rejects(f.environment.execute('true',f.source,{stopSignal:AbortSignal.timeout(35)}),/identity unknown|unresolved/i);
+ assert.equal(payloads,1);assert.ok(f.events.some(event=>event.type==='execution-unresolved'&&!event.data.handle));
+ assert.equal((await f.environment.reconcileOperation({operation:'missing',events:f.events})).closed,false);
+});
+test('abort during submission journal write records positive refusal before any native dispatch',async t=>{
+ const f=await fixture(t,async args=>args[0]==='run'?{state:'queued',handle:'remote:fixture:job:sync'}:undefined);await f.prepare();
+ const record=f.context.event;f.context.stopSignal=AbortSignal.timeout(1000);f.context.event=async(type,data)=>{
+  await record(type,data);if(type==='execution-submitting'&&data.receiptFile?.endsWith('/submission.json'))f.abort.abort();
+ };
+ await assert.rejects(f.environment.execute('true',f.source),error=>error.code==='CPL_NOT_ADMITTED');
+ assert.equal(f.calls.filter(call=>call.args[0]==='run'&&call.args[call.args.indexOf('--file')+1].endsWith('command.sh')).length,0);
+ const pending=f.events.find(event=>event.type==='execution-submitting'&&event.data.receiptFile?.endsWith('/submission.json'));
+ assert.ok(f.events.some(event=>event.type==='execution-not-admitted'&&event.data.submission===pending.data.submission));
+ assert.equal(f.events.some(event=>event.type==='execution-unresolved'&&event.data.submission===pending.data.submission),false);
+});
+for(const boundary of ['matched','wrong-nonce','wrong-token','not-released'])test(`lost native identity requires positive matching wrapper and released admission: ${boundary}`,async t=>{
+ let command,dispatched=0;
+ const f=await fixture(t,async args=>{
+  if(args[0]==='run'){
+   const file=args[args.indexOf('--file')+1];if(file.endsWith('sync.sh'))return {state:'queued',handle:'remote:fixture:job:sync'};
+   command=JSON.parse((await readFile(file,'utf8')).slice((await readFile(file,'utf8')).lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));dispatched++;throw Error('Lost native response before receipt');
+  }
+  if(args[0]==='download'){
+   const value=args[2].endsWith('/timing.json')?JSON.stringify({completed:true,key:boundary==='wrong-nonce'?'different':command.timingKey,executionSeconds:2.575,outcome:{kind:'command'}}):args[2].endsWith('/admission.json')?JSON.stringify({token:boundary==='wrong-token'?'different':'lease-token',decision:'admitted',released:boundary!=='not-released'}):args[2].endsWith('/exit')?'0':'unused';
+   await writeFile(args[3],value);return {state:'completed'};
+  }
+ });
+ await f.prepare();await assert.rejects(f.environment.execute('true',f.source,{leaseReceipt:true,admissionToken:'lease-token'}),/identity unknown/);
+ const pending=f.events.find(event=>event.type==='execution-submitting'&&event.data.receiptFile?.endsWith('/submission.json'));
+ const proof=await f.environment.reconcileOperation({operation:pending.data.submission,events:f.events});
+ assert.equal(proof.closed,boundary==='matched');assert.equal(dispatched,1);assert.deepEqual(proof.handles,[]);
+ if(boundary==='matched'){assert.equal(proof.executionSeconds,2.575);assert.equal(proof.nativeIdentityMissing,true);assert.equal(proof.wrapperClosures.length,1);assert.equal(proof.wrapperClosures[0].admission.token,'lease-token');assert.equal(proof.artifactsUnresolved,true);assert.equal(proof.correct,undefined);}
 });

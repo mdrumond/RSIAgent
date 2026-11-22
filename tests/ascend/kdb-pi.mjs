@@ -140,6 +140,19 @@ test('native Pi MCP retrieval preserves correlation, citations and permission ga
       const [code]=await once(inspect,'exit');
       assert.equal(code,0);
       assert.equal(output.trim(),'1');
+      blocked=false;
+      const searchableId='b'.repeat(64);
+      const indexedNote=await ctx.executeTool('mcp__kdb__record_lesson',{
+        lesson:'Scoped vector reduction guidance\nsearchable-skill:'+searchableId,
+        outcome:'good',applicability:'a3',evidence:data.evidence,attempt_id:'pi-attempt'});
+      assert.equal(indexedNote.isError,false,JSON.stringify(indexedNote.result));
+      const note=indexedNote.result.structuredContent.structuredContent;
+      await bridge.knowledge.search({query:'vector reduction guidance'},ctx);
+      await ctx.executeTool('mcp__kdb__read_entry',{collection:note.collection,entry_id:note.entry_id});
+      const exposure=events.filter(event=>event.type==='searchable-skill-exposed');
+      assert.deepEqual(exposure.map(event=>event.operation),['search','read-entry']);
+      assert.equal(exposure[0].query,'vector reduction guidance');
+      assert.deepEqual(exposure.map(event=>event.entries),Array.from({length:2},()=>[{id:searchableId,collection:note.collection,entryId:note.entry_id}]));
     } finally {
       if (session) {
         await session.extensionRunner.emit({type:'session_shutdown',reason:'exit'});

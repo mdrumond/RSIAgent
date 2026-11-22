@@ -106,18 +106,35 @@ def create_server(backend_factory, *, port=8765):
     async def invoke(ctx, operation, **args):
         return await dispatch(invoke_backend, attempt(ctx), operation, args)
 
+    def attention_options(ctx, include_retired, chosen):
+        options = dict(include_retired=True) if include_retired else {}
+        request = ctx.request_context.request
+        header = request.headers.get('x-attention-revision') if request is not None else None
+        if header is not None:
+            pinned = int(header)
+            if chosen is not None and chosen != pinned:
+                raise ValueError('Attention revision is pinned for this session')
+            chosen = pinned
+        if chosen is not None:
+            options['attention_revision'] = chosen
+        return options
+
     @server.tool()
     async def search(query: str, ctx: Context, kind: str = 'all',
                      target: str | None = None, limit: int = 10,
-                     generation: str | None = None) -> list[dict]:
+                     generation: str | None = None, include_retired: bool = False,
+                     attention_revision: int | None = None) -> list[dict]:
         """Search positive/negative source knowledge within a target scope."""
-        return await invoke(ctx, 'search', query=query, kind=kind, target=target, limit=limit,
+        options = attention_options(ctx, include_retired, attention_revision)
+        return await invoke(ctx, 'search', **options, query=query, kind=kind, target=target, limit=limit,
                             generation=generation)
 
     @server.tool()
-    async def read_entry(collection: str, entry_id: str, ctx: Context, generation: str | None = None) -> dict[str, Any]:
+    async def read_entry(collection: str, entry_id: str, ctx: Context, generation: str | None = None,
+                         include_retired: bool = False, attention_revision: int | None = None) -> dict[str, Any]:
         """Read stored chunk text (up to16KiB UTF-8) and direct validated evidence."""
-        return await invoke(ctx, 'read_entry', collection=collection, entry_id=entry_id, generation=generation)
+        options = attention_options(ctx, include_retired, attention_revision)
+        return await invoke(ctx, 'read_entry', **options, collection=collection, entry_id=entry_id, generation=generation)
 
     @server.tool()
     async def add_repo(path: str, collection: str, language: str, ctx: Context,
@@ -181,6 +198,9 @@ def main():
                                                      'record-lesson'], default='serve')
     parser.add_argument('--arguments', default='{}', help='JSON backend arguments')
     args = parser.parse_args()
+    # Tokenizers otherwise creates a host-sized Rayon pool on the first batch.
+    if "RAYON_NUM_THREADS" not in os.environ:
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     def backend_factory():
         if args.embedding_factory:
             from importlib import import_module

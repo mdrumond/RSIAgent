@@ -1,3 +1,4 @@
+import {attemptAttention,occurrenceAttention} from '../controller/failure-attention.mjs';
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { cp, mkdir, readFile, stat,appendFile } from 'node:fs/promises';
@@ -5,6 +6,7 @@ import { join, resolve, relative, sep, dirname } from 'node:path';
 import { modelFromProfile } from '../controller/model.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import {State} from '../controller/state.mjs';
+import {projectSummary as buildProjectSummary,validateClaims,proofInstructions} from './project-summary.mjs';
 import {projectBundle,validateBundle} from './project-bundle.mjs';
 import {createLocalExecutionOperations} from '../integrations/environments/local-bash.mjs';
 
@@ -32,13 +34,14 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
   const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
   const providerPath=join(path,'provider-'+role+'.jsonl');
   let remaining=()=>config.curriculum_seconds??240;
+  const readOnly=role==='summary';
   const local=createLocalExecutionOperations(sdk,config.local_execution);
   const loader=new sdk.DefaultResourceLoader({cwd:path,agentDir,settingsManager,noExtensions:true,noSkills:true,
     extensionFactories:[bridge.extension,pi=>{
       if(config.storage)for(const type of ['before_provider_request','provider_stream_event'])
         pi.on(type,payload=>appendFile(providerPath,JSON.stringify(payload)+'\n'));
       pi.on('tool_call',()=>accepted()?{block:true,reason:'Submission already accepted; further tools are closed.'}:undefined);
-      pi.registerTool(sdk.createBashToolDefinition(path,{operations:{exec:(command,cwd,options)=>local.exec(command,cwd,
+      if(!readOnly)pi.registerTool(sdk.createBashToolDefinition(path,{operations:{exec:(command,cwd,options)=>local.exec(command,cwd,
         {...options,timeout:Math.min(options.timeout??Infinity,remaining())})}}));
       for(const entry of (Array.isArray(tool)?tool:[tool]))pi.registerTool({...entry,
         execute:(id,args,signal,update,ctx)=>entry.execute(id,args,signal,update,ctx,{remainingSeconds:remaining})});
@@ -58,7 +61,7 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
     }finally{ledger.close();}
   }
   const {session}=await sdk.createAgentSession({cwd:path,agentDir,settingsManager,...await modelFromProfile(config.curriculum_actor??config.actor),
-    thinkingLevel:'off',tools:['read','write','edit','bash','mcp__kdb__*',...(Array.isArray(tool)?tool:[tool]).map(entry=>entry.name)],resourceLoader:loader,sessionManager:manager});
+    thinkingLevel:'off',tools:[...(readOnly?['read','grep','find','ls']:['read','write','edit','bash']),'mcp__kdb__*',...(Array.isArray(tool)?tool:[tool]).map(entry=>entry.name)],resourceLoader:loader,sessionManager:manager});
   const started=performance.now();
   const spent=()=>elapsed+(performance.now()-started)/1000;
   remaining=()=>Math.max(.001,seconds-spent());
@@ -126,8 +129,8 @@ async function artifactFile(root,name,source) {
   return file;
 }
 const reply=()=>({content:[{type:'text',text:'Recorded'}],details:{}});
-function diagnosticContext(state,id,limit) {
-  const tail=options=>state.queryEvents(id,{...options,order:'desc'}).reverse();
+export function diagnosticContext(state,id,limit) {
+  const tail=options=>state.queryEvents(id,{...options,order:'desc'}).reverse().filter(e=>e.type==='verification'||attemptAttention(state.db,id)==='active'&&occurrenceAttention(state.db,`events:${e.sequence}`)==='active');
   const events=tail({excludeTypes:['pi-event'],limit}).map(({type,data})=>({type,data}));
   const sessions=tail({types:['curriculum-session'],limit}).map(event=>event.data);
   return {session:state.attempt(id)?.session??sessions.at(-1)?.session??null,curriculum_sessions:sessions,
@@ -203,20 +206,27 @@ export async function investigate({config,job,base,path,state,bridge,signal}) {
     actor_seconds:job.actor_seconds,verifier:{files:[verifier],command:proposal.verifier_command??investigationCommand(source,verifier)}},path);
 }
 
-export async function summarize({config,job,path,state,bridge,passed,signal}) {
+export async function summarize({config,job,path,state,bridge,passed,signal,projectSummary}) {
+  projectSummary??=await buildProjectSummary({state,projectId:state.attempt(job.attempt.id).project});
   let findings;
-  await curriculumSession({config,path,bridge,signal,state,attemptId:job.attempt.id,role:'summary',accepted:()=>Boolean(findings),prompt:
+  const records=[...projectSummary.facts,...projectSummary.references];
+  await curriculumSession({config,path,bridge,signal,state,attemptId:job.attempt.id,role:'summary',resume:true,accepted:()=>Boolean(findings),prompt:
     `Inspect the native session, verification logs and stage events for this ${job.kind??'original'} attempt. `+
     `Workflow/project accepted: ${passed}. Summarize actual findings and failures as compact reusable memory. `+
     `For an investigation, useful=true ONLY when new observed evidence addresses the original gap, even if the investigation failed. `+
+    `Complete project facts (project outcome differs from verification outcomes): ${JSON.stringify(projectSummary)}\n`+
+    `Submit claims with copied proof reference/quote, observation|hypothesis kind. For inspected files listed in paths use reference=file:<exact listed path> and quote a contiguous actual file span. Typed fact proofs also require its factId and exact value. Findings are composed from accepted claims, not uncited prose. ${proofInstructions}\n`+
     `Attempt diagnostics: ${JSON.stringify(diagnosticContext(state,job.attempt.id,30))}\n`+
     `Controller diagnostic snapshot: ${join(path,'diagnostics.json')}. Read the recorded native session when present and diagnostic evidence files. Submit the compact findings with direct evidence paths.`,
     tool:{name:'record_findings',label:'Record findings',description:'Record evidence-based findings and usefulness.',
-      parameters:Type.Object({findings:Type.String({minLength:1,maxLength:4000}),useful:Type.Boolean(),
+      parameters:Type.Object({claims:Type.Array(Type.Unknown(),{minItems:1}),useful:Type.Boolean(),
         paths:Type.Array(Type.String(),{minItems:1,maxItems:16})}),
       execute:async(_id,args)=>{
-        for(const name of args.paths)await artifactFile(path,name);
-        findings=args;return reply();
+        const files=[];for(const name of args.paths){const actual=await artifactFile(path,name),info=await stat(actual);if(info.size>1048576)throw Error('Proof file exceeds bounded evidence limit; use the project facts or a smaller retained artifact');files.push({reference:'file:'+name,text:await readFile(actual,'utf8')});}
+        validateClaims(args.claims,[...records,...files]);
+        const text=args.claims.map(c=>(c.kind==='hypothesis'?'Unverified hypothesis: ':'')+c.text).join('\n');
+        if(text.length>4000)throw Error('Composed findings exceed 4000 characters; shorten claims and resubmit');
+        findings={...args,findings:text};return reply();
       }}});
   if(!findings)throw new Error('Curriculum did not record attempt findings');
   const {createHash}=await import('node:crypto');

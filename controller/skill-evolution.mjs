@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile, rename, cp } from 'node:fs/promises';
 import { join, resolve, relative, dirname, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { stages } from './workflow.mjs';
+import {skillConfig} from './skill-context.mjs';
 import { evaluateRound, positiveSeconds } from './evaluation-round.mjs';
 import { generateCandidate } from './skill-proposal.mjs';
 import { selectSkillEvidence, skillEventTypes } from './skill-evidence.mjs';
@@ -103,7 +104,7 @@ async function readEntries(directory) {
   }
 }
 
-async function writeVersion(root, entries, source) {
+export async function writeVersion(root, entries, source) {
   const version = randomUUID();
   const directory = join(root, 'skills', 'versions', version);
   await cp(source, directory, { recursive: true, errorOnExist: true, force: false });
@@ -190,7 +191,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     runs: current.skills?.microEvaluation?microRuntime.settings(current).runs:current.skills?.runsPerArm??2,
     evaluationSeconds:current.skills?.microEvaluation?Math.min(microRuntime.settings(current).totalSeconds,background?positiveSeconds(backgroundSeconds):current.skills?.evaluationSeconds??Infinity):background?positiveSeconds(backgroundSeconds):current.skills?.evaluationSeconds,
     evaluationRoot: join(directory, 'evaluations', randomUUID()), sourceInstanceRoot: root,
-    config: { ...structuredClone(current), mode }, ...(background ? { resource: backgroundResource } : {}), allocations: [], ...fields });
+    config: skillConfig({ ...structuredClone(current), mode }), ...(background ? { resource: backgroundResource } : {}), allocations: [], ...fields });
   if (grant && !state.pending) {
     if (!state.candidate) throw new Error('Prepare a skill candidate before allocating evaluation time');
     const ids = current.skills?.tuningProjectIds ?? [...new Set(originals(state.history).map(x => x.projectId))].sort().slice(0, 2);

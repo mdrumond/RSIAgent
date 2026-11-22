@@ -256,3 +256,27 @@ test('canonical terminal settlement pauses round elapsed and resumes retained re
   assert.equal(await readFile(retainedSession, 'utf8'), 'completed native Bash session fixture\n');
 
 });
+
+
+test('legacy round policy blocks cached arm reuse and promotion before unfinished arm bootstrap',async t=>{
+ for(const completed of [false,true])for(const updatedPending of [false,true]){
+  const f=await fixture(t,10);f.config.actor={provider:'fixture',model:'scripted'};await save(join(f.root,'instance.json'),f.config);
+  await f.run({task:task(0)});let calls=0;
+  await assert.rejects(f.run({task:task(1),evaluate:async request=>{
+   if(calls++===0)return score(request);
+   throw Object.assign(Error('Pause partial round'),{evaluationStopped:true});
+  }}),/Pause partial round/);
+  const statePath=join(f.root,'skills','evolution.json'),state=await load(statePath),roundPath=join(state.pending.evaluationRoot,'round.json'),round=await load(roundPath);
+  assert.equal(state.pending.config.actor.max_context_tokens,200000);assert.equal(round.contextPolicy.actor.maxContextTokens,200000);
+  if(completed)for(const sample of round.samples)sample.result=score(sample);
+  delete round.contextPolicy;
+  if(!updatedPending)delete state.pending.config.actor.max_context_tokens;
+  await save(statePath,state);await save(roundPath,round);const before=await readFile(roundPath,'utf8');
+  let bootstraps=0,evaluations=0,promotions=0;
+  await assert.rejects(f.run({evaluate:async request=>{bootstraps++;evaluations++;return score(request);},publish:async()=>{promotions++;return f.config;}}),/context policy differs/);
+  assert.equal(bootstraps,0);assert.equal(evaluations,0);assert.equal(promotions,0);
+  assert.equal(await readFile(roundPath,'utf8'),before);assert.equal((await load(join(f.root,'instance.json'))).skills.activeVersion,'baseline');
+  assert.equal((await load(statePath)).pending.evaluationRoot,state.pending.evaluationRoot);
+  await assert.rejects(readFile(join(state.pending.evaluationRoot,'decision.json')),{code:'ENOENT'});
+ }
+});

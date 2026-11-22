@@ -23,6 +23,15 @@ export async function until(check,timeout=15000) {
   while (Date.now()<end) {const value=await check();if(value)return value;await delay(50);}
   throw new Error('Timed out waiting for observable driver transition');
 }
+export async function waitForStorage(root,timeout=15000){
+ return until(async()=>{
+  if(!rows(root,"SELECT 1 FROM sqlite_master WHERE name='requests'").length)return true;
+  for(const request of rows(root,"SELECT status,owner FROM requests WHERE kind='storage'")){
+   if(['queued','running'].includes(request.status)||request.owner&&!await ownerStopped(request.owner))return false;
+  }
+  return true;
+ },timeout);
+}
 export async function setup(t,scenario,ids,{install=false,projectFactory,providerOptions={}}={}) {
   const root = await mkdtemp(join(process.env.DRIVER_ARTIFACTS ?? tmpdir(),'driver-acceptance-'));
   const instance = join(root,'instance'), server = await provider(scenario,{...providerOptions,nativeSession:async()=>
@@ -57,15 +66,7 @@ export async function setup(t,scenario,ids,{install=false,projectFactory,provide
     // Scheduler shutdown only submits final compression. Its detached request
     // owns files in this fixture until the request process has also exited.
     // On timeout leave the tree intact and fail cleanup rather than racing rm.
-    await until(async()=>{
-      if(!rows(instance,"SELECT 1 FROM sqlite_master WHERE name='requests'").length)return true;
-      const storage=rows(instance,"SELECT status,owner FROM requests WHERE kind='storage'");
-      for(const request of storage) {
-        if(['queued','running'].includes(request.status))return false;
-        if(request.owner && !await ownerStopped(request.owner))return false;
-      }
-      return true;
-    });
+    await waitForStorage(instance);
     try {
       const receipt=JSON.parse(await readFile(join(instance,'knowledge-service.json'),'utf8'));
       if(!await ownerStopped(receipt.owner))process.kill(receipt.owner.pid,'SIGTERM');

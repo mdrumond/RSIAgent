@@ -20,16 +20,17 @@ def runtime_identity(binding):
             return [str(path), None]
 
     packages = {}
-    for name in ("torch", "torch-npu", "triton", "triton-ascend", "catlass", "catlass-dsl"):
+    for name in ("torch", "torch-npu", "triton", "triton-ascend", "catlass", "catlass-dsl", "ascend-catlass-dsl"):
         try:
             dist = importlib.metadata.distribution(name)
             record = (dist.read_text("RECORD") or "") + (dist.read_text("direct_url.json") or "")
+            native = sorted(Path(dist.locate_file("catlass")).rglob("*.so")) if name in ("catlass", "catlass-dsl", "ascend-catlass-dsl") else []
             packages[name] = [dist.version, str(dist.locate_file("")),
                               hashlib.sha256(record.encode()).hexdigest(),
                               [stamp(dist.locate_file(file)) for file in (
                                   "triton/compiler/compiler.py", "triton/backends/ascend/compiler.py",
                                   "triton/_C/libtriton.so", "triton_ascend/__init__.py", "catlass/__init__.py")
-                               if Path(dist.locate_file(file)).exists()]]
+                               if Path(dist.locate_file(file)).exists()] + [stamp(path) for path in native]]
         except importlib.metadata.PackageNotFoundError:
             continue
     tools = {name: stamp(path) for name in ("bisheng", "bishengir-compile", "hivmc", "ptxas")

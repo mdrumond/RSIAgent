@@ -47,8 +47,10 @@ test('target lock excludes a second controller; killed owner leaves durable fenc
   }
   const first=run(`touch '${marker}'; while [ ! -e '${release}' ]; do sleep .01; done`);
   for(let n=0;;n++){try{await readFile(marker);break;}catch{}assert.ok(n<200);await delay(10);}
+  assert.equal(JSON.parse(await readFile(join(directory,'receipt-0'),'utf8')).released,undefined);
   assert.equal((await run('exit 0').done).status,126);
   await writeFile(release,'go');assert.equal((await first.done).status,0);
+  assert.equal(JSON.parse(await readFile(join(directory,'receipt-0'),'utf8')).released,true);
   assert.equal((await run('exit 0').done).status,0);
   // No payload descendants remain when killing this wrapper after completion of health.
   const killed=run('exec sleep 0.2');await delay(80);killed.child.kill('SIGKILL');
@@ -57,7 +59,7 @@ test('target lock excludes a second controller; killed owner leaves durable fenc
   assert.equal((await run('',hostReconcile,'wrong-owner').done).status,125);
   assert.equal((await run('',hostReconcile).done).status,0);
   assert.equal((await run('exit 126').done).status,126);
-  assert.equal(JSON.parse(await readFile(join(directory,'receipt-'+(children.length-1)),'utf8')).decision,'admitted');
+  assert.deepEqual(JSON.parse(await readFile(join(directory,'receipt-'+(children.length-1)),'utf8')),{token:'owner',decision:'admitted',released:true});
 });
 
 test('admission holds unpublished time then charges only nonqueue work',async()=>{
@@ -84,6 +86,35 @@ test('a stopped owner is reclaimed only after every native identity and host fen
   assert.equal(proof.closed,true);assert.deepEqual(calls,['remote:target:job:payload','remote:target:transfer:copy','fence']);
   await assert.rejects(readFile(lease.receipt),{code:'ENOENT'});
   assert.ok(await reserveDevice('pool',0,directory));
+});
+
+test('an unidentified excluded output download remains recorded after positive device closure',async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory);
+  const artifact={submission:'lost-output-download',kind:'download',accountingExcluded:true,receiptFile:null};
+  await lease.update({owner:{...lease.record.owner,start:'old-process'},handles:['remote:target:job:payload']});
+  await lease.event('execution-submitting',artifact);
+  const observed=[];
+  const result=await reconcileDeviceLease(lease.receipt,{
+    observe:async handle=>{observed.push(handle);return {state:'completed'};},reconcileHost:async()=>true
+  });
+  assert.equal(result.closed,true);assert.deepEqual(observed,['remote:target:job:payload']);
+  assert.deepEqual(result.unresolvedArtifacts,[artifact]);
+  const proof=await closedDeviceLease(lease.receipt,lease.token);
+  assert.deepEqual(proof.unresolvedArtifacts,[artifact]);
+  const archived=JSON.parse(await readFile(join(proof.path,'lease.json'),'utf8'));
+  assert.deepEqual(archived.submissions,[artifact]);
+  assert.equal(archived.submissions[0].closed,undefined,'the transfer was never declared closed');
+  assert.ok(await reserveDevice('pool',0,directory));
+});
+
+for(const row of [{kind:'run',accountingExcluded:true},{kind:'upload',accountingExcluded:true},{kind:'download',accountingExcluded:false}])test(`unknown ${row.kind}/${row.accountingExcluded} cannot be treated as an output-only artifact`,async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory);
+  await lease.update({owner:{...lease.record.owner,start:'old-process'}});
+  await lease.event('execution-submitting',{submission:'unknown',...row});
+  let fenced=0;
+  const result=await reconcileDeviceLease(lease.receipt,{observe:async()=>({state:'completed'}),reconcileHost:async()=>{fenced++;return true;}});
+  assert.equal(result.closed,false);assert.equal(result.reason,'submission-unknown');assert.equal(fenced,0);
+  assert.equal(JSON.parse(await readFile(lease.receipt,'utf8')).token,lease.token);
 });
 
 for(const scenario of ['live-owner','legacy-owner','live-job','unknown-submission','unknown-fence'])test(`reservation reconciliation preserves ${scenario}`,async t=>{
@@ -147,4 +178,13 @@ test('peer closure during native observation is positive proof rather than a mis
     reconcileHost:async held=>{await held.update({controlStarted:true});return true;}
   });
   assert.equal(result.closed,true);assert.ok(await reserveDevice('pool',0,directory));
+});
+test('wrapper closure confirms only the matching token-owned lost submission',async t=>{
+ const lease=await reserveDevice('wrapper-proof',0,await root(t));
+ await lease.event('execution-submitting',{submission:'missing',kind:'run',receiptFile:'/owned/submission.json',accountingExcluded:false});
+ await lease.event('execution-submitting',{submission:'other',kind:'run',receiptFile:'/other/submission.json',accountingExcluded:false});
+ const proof={submission:'missing',receiptFile:'/owned/submission.json',closed:true,timingKey:'random-nonce',admissionToken:lease.token,admission:{token:lease.token,decision:'admitted',released:true},nativeIdentityMissing:true};
+ for(const changed of [{admissionToken:'foreign'},{receiptFile:'/other/submission.json'},{admission:{token:lease.token,decision:'admitted',released:false}}])assert.equal(await lease.confirmSubmissionClosed({...proof,...changed}),false);
+ assert.equal(await lease.confirmSubmissionClosed(proof),true);
+ const record=JSON.parse(await readFile(lease.receipt,'utf8'));assert.equal(record.submissions[0].closed,true);assert.equal(record.submissions[1].closed,undefined);assert.deepEqual(record.handles,[]);
 });

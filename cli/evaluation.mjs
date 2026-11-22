@@ -1,3 +1,4 @@
+import {skillConfig} from '../controller/skill-context.mjs';
 import { managedBootstrap, bootstrapSettled } from './evaluation-bootstrap.mjs';
 import { fingerprint } from '../controller/evidence.mjs';
 import { join, resolve, dirname } from 'node:path';
@@ -11,6 +12,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 // Every A/B sample gets its own state, source, verifier, memory and native evidence.
 export async function bootstrap(request) {
+  request={...request,config:skillConfig(request.config)};
   request.signal?.throwIfAborted();
   const original=await readConfig(request.sourceInstanceRoot);
   const inputs=join(dirname(request.instanceRoot),'inputs');
@@ -71,14 +73,18 @@ export async function bootstrap(request) {
   const {root:_root,skills:_skills,projects:_projects,baselineKDB:_baseline,
     campaign_plan:_plan,phase_sequence:_sequence,phase_targets:_targets,completion_target:_target,...settings}=request.config;
   const environment=structuredClone(frozen.environment);
+  const {promotionGate:_promotionGate,...skillSettings}=request.config.skills??{};
   request.signal?.throwIfAborted();
   await createInstance(request.instanceRoot,{initialization,...settings,curriculum:{...settings.curriculum,[settings.mode]:[project.id]},resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),
     skills:join(original.root,'skills','versions',request.skillVersion),
-    skillSettings:{...request.config.skills,tuningDisabled:true},projects:[project],environment,
+    skillSettings:{...skillSettings,tuningDisabled:true},projects:[project],environment,
     signal:request.signal,machinery:join(inputs,'machinery')});
   });
 }
 export async function wave({instanceRoot,config,signal,resuming=false,remainingSeconds}) {
+  const retained=await readConfig(instanceRoot),bounded=skillConfig(retained);
+  if(['actor','curriculum_actor','skill_writer_actor'].some(key=>JSON.stringify(retained[key])!==JSON.stringify(bounded[key])))
+    throw Error('Frozen evaluation context policy differs; start a fresh comparison without reusing old arms');
   const log=await open(join(instanceRoot,'evaluation-wave.log'),'a',0o600);
   try {
     await new Promise((ok,no)=>{

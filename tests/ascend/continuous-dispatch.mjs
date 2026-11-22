@@ -136,6 +136,8 @@ test('public generation binds real KDB tools and admits its constructed campaign
   assert.ok(f.rows("SELECT COUNT(*) n FROM events WHERE json_extract(data,'$.role')='generation'")[0].n>0);
   assert.equal(f.rows("SELECT status FROM projects WHERE id='supplied'")[0].status,'queued');
   const generated=JSON.parse(f.rows("SELECT spec FROM projects WHERE id='"+attempts[0].project+"'")[0].spec);
-  assert.deepEqual(generated.generation.checks.map(check=>check.exitCode),[0,1]);
+  assert.deepEqual(generated.generation.checks.map(({kind,exitCode})=>({kind,exitCode})),[
+    {kind:'reference',exitCode:0},{kind:'negative',exitCode:1},{kind:'starter',exitCode:0}]);
+  assert.equal(f.rows("SELECT status FROM projects WHERE id='"+attempts[0].project+"'")[0].status,'passed');
   passed=true;
 });

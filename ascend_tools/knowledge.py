@@ -300,7 +300,7 @@ class KnowledgeDB:
         return _VectorMatrix(tuple(ids), values, norms)
 
     def cosine_scores(self, collection, query_vector, check_remaining=None):
-        self.manifest(collection)
+        manifest = self.manifest(collection)
         query = _normalize(query_vector)
         cached = self._vectors.get(collection)
         if cached is not None:
@@ -308,8 +308,16 @@ class KnowledgeDB:
             if check_remaining:
                 check_remaining()
             return list(cached.scores(query))
+        # Bind the embedding identity once. The chunks view extracts it from
+        # the collection manifest for every match, including on large scans.
         cursor = self.connection.execute(
-            'SELECT chunk_id,vector FROM chunks WHERE collection=? ORDER BY chunk_id', (collection,))
+            """SELECT p.chunk_id,v.vector FROM chunk_provenance p
+               JOIN chunk_contents t ON t.content_id=p.content_id
+               CROSS JOIN chunk_vectors v ON v.content_id=p.content_id
+               WHERE p.collection=? AND v.model=? AND v.revision=?
+               ORDER BY p.chunk_id""",
+            (collection, manifest.embedding_model, manifest.embedding_revision),
+        )
         matrices, scores, size = [], [], 0
         while rows := cursor.fetchmany(256):
             if check_remaining:

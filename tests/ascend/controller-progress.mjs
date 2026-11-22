@@ -310,3 +310,23 @@ test('a new plan attaches to unassigned history without recounting it or excludi
     projects:current.projects.map(project=>project.id==='queued'?{...project,campaign_entry:assignment}:project)})),/matching/);
   assert.equal((await readConfig(root)).projects.find(project=>project.id==='passed').campaign_entry,undefined);
 });
+
+test('durable cleanup custody allows the next campaign batch while the old failed outcome remains',async t=>{
+ const {reconcileFailure}=await import('../../controller/lifecycle.mjs');
+ const {currentCampaignEntry,syncCampaignPlan,advanceCampaignEntry}=await import('../../controller/progress.mjs');
+ const {state,queue}=fixture(t),config={campaign_plan:[{id:'one',phase:'phase1',new_projects:1},{id:'two',phase:'phase2',new_projects:1}],projects:[]};
+ for(const entry of config.campaign_plan){const p={id:entry.id,goal:'test',actor_seconds:10,phase:entry.phase,campaign_entry:entry.id};config.projects.push(p);state.add(p);}
+ syncCampaignPlan(state,config);const job=queue.claim('one',0);
+ queue.recordOriginal(job.attempt.id,{passed:false,findings:'payload failed',evidence:[{collection:'memory',entry_id:'failure'}]},0);
+ queue.acknowledgeLesson(queue.lessons()[0].id);state.event(job.attempt.id,'postprocess-completed',{});
+ state.event(job.attempt.id,'execution-starting',{operation:'old',startElapsed:0});
+ state.event(job.attempt.id,'execution-unresolved',{operation:'old',handle:null});
+ state.event(job.attempt.id,'failure-settlement',{closed:false});
+ assert.equal(advanceCampaignEntry(state,config),false);
+ assert.equal(await reconcileFailure(state,job.attempt.id,{reconcileOperation:async()=>({closed:true,
+  executionSeconds:0,cleanupPending:{id:'retained-token'},deferredHandles:[],
+  unresolvedArtifacts:[{kind:'download',accountingExcluded:true,receiptFile:null}]})}),true);
+ assert.equal(state.attempt(job.attempt.id).outcome,'failed');
+ assert.equal(advanceCampaignEntry(state,config),true);assert.equal(currentCampaignEntry(state,config).id,'two');
+ assert.equal(queue.claim('two',1).project.id,'two');
+});

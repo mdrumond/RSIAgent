@@ -1,10 +1,12 @@
 import { createEnvironment as genericEnvironment, createCplClient, closedSetupError } from './index.mjs';
 import { readFile, writeFile, mkdir, mkdtemp, rename, unlink, cp, readdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { reserveDevice, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLease, closedDeviceLease, closeDeviceLease, hostLease, hostReconcile } from './device-leases.mjs';
+import { reserveDevice, retirePrePayloadLease, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLease, closedDeviceLease, closeDeviceLease, artifactDownload, hostLease, hostReconcile } from './device-leases.mjs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
+import {queueDeviceCleanup,activateDeviceCleanup,resumeDeviceCleanup,cleanupDirectory} from './device-cleanup.mjs';
+import { ownerStopped,processIdentity } from '../../controller/lifecycle.mjs';
 
 const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const digest = text => createHash('sha256').update(text).digest('hex');
@@ -64,7 +66,10 @@ export async function createEnvironment(options, context) {
     return nativeClient(args, {signal});
   };
   let activeLease, activeExclude;
-  const leasePath = join(context.instancePath, '.ascend-command-lease.json');
+  const leasePath = context.cleanupLeasePath??join(context.instancePath, '.ascend-command-lease.json');
+  const asyncCleanup=options.asyncCleanup!==false&&!context.cleanupLeasePath;
+  const cleanupQueue=cleanupDirectory(context);
+  if(asyncCleanup&&context.activateCleanup!==false)await resumeDeviceCleanup(cleanupQueue,{launch:context.cleanupLaunch});
   const commandContext = {...context, client, exclude:(label,fn)=>activeExclude?activeExclude(label,fn):context.exclude(label,fn), event: async (type, data) => {
     if (activeLease && ['execution-submitting','execution-submitted','execution-not-admitted','execution-handle'].includes(type)) {
       await activeLease.event(type,data);
@@ -212,7 +217,9 @@ export async function createEnvironment(options, context) {
         await save(pendingPath, pending);
         await emit('execution-submitting', { submission, receiptFile: receipt, kind: 'run', accountingExcluded: true });
         let submitted;
-        try { submitted = await client(['run', options.target, '--runtime', options.runtime, '--file', file, '--receipt-file', receipt]); }
+        if(observationSignal.aborted){await emit('execution-not-admitted',{submission,closed:true});await unlink(pendingPath);observationSignal.throwIfAborted();}
+        const receiptSignal=context.stopSignal??context.signal;
+        try { submitted = await client(['run', options.target, '--runtime', options.runtime, '--file', file, '--receipt-file', receipt],{signal:receiptSignal}); }
         catch { try { submitted = await readJson(receipt); } catch { /* unknown; retain pending */ } }
         if (submitted?.admitted === false || submitted?.submitted === false) {
           await emit('execution-not-admitted', { submission, closed: true });
@@ -232,6 +239,16 @@ export async function createEnvironment(options, context) {
       }
       await emit('execution-submitted', { submission, handle: pending.handle, closed: false, accountingExcluded: true });
       await context.event('execution-handle', { handle: pending.handle, purpose: 'resource-health' });
+      if(observationSignal.aborted&&context.stopSignal){
+        const cleanupSignal=context.stopSignal;
+        try{await client(['cancel',pending.handle],{signal:cleanupSignal});}catch{}
+        while(!cleanupSignal.aborted){
+          let state;try{state=await client(['observe',pending.handle],{signal:cleanupSignal});}catch{break;}
+          if(terminal.has(state.state)){await context.event('execution-state',{handle:pending.handle,state:'stopped',nativeState:state.state,executionSeconds:0,accountingExcluded:true});break;}
+          try{await delay(options.pollMs??250,undefined,{signal:cleanupSignal});}catch{break;}
+        }
+        observationSignal.throwIfAborted();
+      }
       const elapsed = () => Number(process.hrtime.bigint() - BigInt(pending.startedMonotonic)) / 1e9;
       let observed;
       do {
@@ -360,11 +377,96 @@ export async function createEnvironment(options, context) {
     await controlEnvironment.prepare({project:{source:sourcePath},attempt:{id:'lease-control'}});
     return controlEnvironment;
   }
+  async function deferCleanup(lease){
+    const pointer=join(context.instancePath,'.device-cleanup',lease.token+'.json');
+    await mkdir(dirname(pointer),{recursive:true});
+    await save(pointer,{receipt:lease.receipt,token:lease.token,pool:lease.record.pool,physicalDevice:lease.record.physicalDevice});
+    const request={id:lease.token,token:lease.token,receipt:lease.receipt,pointer,options,
+      instancePath:context.instancePath,leaseDirectory:context.leaseDirectory,campaignRoot:context.campaignRoot,
+      journal:pointer+'.events.jsonl',activePointer:leasePath,handoffOwner:await processIdentity(),createdAt:Date.now(),deadline:Date.now()+observationSeconds*1000};
+    const job=await queueDeviceCleanup(cleanupQueue,request,{launch:context.cleanupLaunch});
+    await lease.update({cleanup:{id:job.id,directory:job.directory,deadline:job.deadline,pointer}});
+    // The cleanup owns its token-specific pointer. It must never unlink the
+    // next command's active pointer when releasing this old reservation.
+    if((await readJson(leasePath)).token!==lease.token)throw Error('Cleanup handoff ownership changed');
+    await unlink(leasePath);
+    const worker=await activateDeviceCleanup(cleanupQueue,job.id,{launch:context.cleanupLaunch}).catch(error=>({launchError:error.message}));
+    Object.assign(job,worker?.owner?{owner:worker.owner}:worker?.launchError?{launchError:worker.launchError}:{});
+    await context.event('device-cleanup-queued',{...job,physicalDevice:lease.record.physicalDevice,token:lease.token});
+    return job;
+  }
+  async function deferClosedLease(){
+    if(!asyncCleanup)return null;
+    let retained;try{retained=await readJson(leasePath);}catch(error){if(error.code==='ENOENT')return null;throw error;}
+    if(await closedDeviceLease(retained.receipt,retained.token))return null;
+    const lease=await openDeviceLease(retained.receipt,retained.token);
+    const wrapperClosed=lease.record.submissions.some(row=>row.wrapperClosure?.closed&&row.wrapperClosure.admission?.token===lease.token);
+    if(!wrapperClosed){
+      if(!lease.record.payloadHandle)return null;
+      const state=await environment.observe(lease.record.payloadHandle,{signal:context.stopSignal??context.signal,accountingExcluded:true});
+      if(state.state!=='stopped')return null;
+    }
+    return deferCleanup(lease);
+  }
+  // Logical settlement may transfer cleanup ownership; it never releases a
+  // physical reservation or invents a terminal artifact-transfer observation.
+  async function retainBackgroundCustody(events){
+    if(!asyncCleanup)return null;
+    let retained;try{retained=await readJson(leasePath);}catch(error){if(error.code==='ENOENT')return null;throw error;}
+    if(await closedDeviceLease(retained.receipt,retained.token))return null;
+    let record;try{record=await readJson(retained.receipt);}catch(error){if(error.code!=='ENOENT')throw error;}
+    if(record?.token===retained.token)return deferClosedLease();
+    const acquired=events.find(e=>e.type==='device-lease-acquired'&&e.data.token===retained.token)?.data;
+    const payload=events.find(e=>e.type==='execution-submitting'&&e.data.operation===acquired?.operation&&
+      e.data.kind==='run'&&e.data.accountingExcluded===false&&e.data.purpose!=='device-lease-control');
+    const handle=payload&&events.find(e=>e.type==='execution-submitted'&&e.data.submission===payload.data.submission)?.data.handle;
+    if(!handle||!events.some(e=>e.type==='execution-state'&&e.data.handle===handle&&e.data.state==='stopped'&&
+      ['completed','failed','cancelled'].includes(e.data.nativeState)))return null;
+    // The old physical row has changed ownership. Preserve its exact-token
+    // obligation in the queue without touching the newer owner's row.
+    const pointer=join(context.instancePath,'.device-cleanup',retained.token+'.json');
+    await mkdir(dirname(pointer),{recursive:true});await save(pointer,retained);
+    const job=await queueDeviceCleanup(cleanupQueue,{id:retained.token,token:retained.token,
+      receipt:retained.receipt,pointer,options,instancePath:context.instancePath,
+      leaseDirectory:context.leaseDirectory,campaignRoot:context.campaignRoot,
+      journal:pointer+'.events.jsonl',activePointer:leasePath,handoffOwner:await processIdentity(),
+      createdAt:Date.now(),deadline:Date.now()+observationSeconds*1000},{launch:context.cleanupLaunch});
+    if((await readJson(leasePath)).token!==retained.token)throw Error('Cleanup custody ownership changed');
+    await unlink(leasePath);
+    try{await activateDeviceCleanup(cleanupQueue,job.id,{launch:context.cleanupLaunch});}
+    catch(error){job.launchError=error.message;}
+    await context.event('device-cleanup-queued',{...job,physicalDevice:retained.physicalDevice,
+      token:retained.token,ownershipChanged:true});
+    return job;
+  }
+  async function blockedBeforePayload({operation,events}){
+    const own=events.filter(e=>e.data.operation===operation||e.data.submission===operation);
+    if(own.some(e=>['execution-submitting','device-lease-acquired'].includes(e.type))||!own.some(e=>e.type==='execution-starting'))return null;
+    const failure=own.find(e=>e.type==='execution-unresolved'&&e.data.handle==null&&
+      e.data.message==='Device lease unresolved; observe retained handles before retry');
+    if(!failure)return null;
+    // Legacy versions did not emit a phase marker. Their precise pre-admission
+    // error is accepted only with a positive token closure and observations
+    // belonging to that same preceding lease; absence of submissions is not proof.
+    const start=events.findIndex(e=>e.type==='execution-starting'&&e.data.operation===operation);
+    const prior=events.slice(0,start).filter(e=>e.type==='device-lease-acquired').at(-1)?.data;
+    for(const {data}of events.filter(e=>e.type==='device-lease-released')){
+      if(!prior||prior.token!==data.token||prior.receipt!==data.receipt)continue;
+      const closed=await closedDeviceLease(data.receipt,data.token);
+      if(!closed)continue;
+      const observed=own.filter(e=>e.type==='execution-state');
+      if(!observed.length||observed.some(e=>!closed.handles?.includes(e.data.handle)))continue;
+      return {closed:true,payloadClosed:true,payloadStarted:false,executionSeconds:0,
+        handles:[],priorLeaseClosure:{receipt:data.receipt,token:data.token}};
+    }
+    return null;
+  }
   async function releaseLease(lease) {
-    await closeDeviceLease(lease);
+    const proof=await closeDeviceLease(lease);
     await unlink(leasePath);
     await context.event('device-lease-released', {pool:lease.record.pool,
-      physicalDevice:lease.record.physicalDevice, receipt:lease.receipt, token:lease.token});
+      physicalDevice:lease.record.physicalDevice, receipt:lease.receipt, token:lease.token,
+      ...(proof.unresolvedArtifacts?{unresolvedArtifacts:proof.unresolvedArtifacts}: {})});
   }
   let reconciling, retryFailedControl=false;
   async function reconcileClosedPayload() {
@@ -397,7 +499,8 @@ export async function createEnvironment(options, context) {
       if(!proof||proof.pool!==retained.pool||proof.physicalDevice!==retained.physicalDevice)return false;
       await preserveControls(proof.path,proof.controlDirectory);
       await unlink(leasePath).catch(error=>{if(error.code!=='ENOENT')throw error;});
-      await context.event('device-lease-released',{pool:proof.pool,physicalDevice:proof.physicalDevice,receipt:retained.receipt,token:retained.token});
+      await context.event('device-lease-released',{pool:proof.pool,physicalDevice:proof.physicalDevice,receipt:retained.receipt,token:retained.token,
+        ...(proof.unresolvedArtifacts?{unresolvedArtifacts:proof.unresolvedArtifacts}: {})});
       return true;
     };
     if(await finishClosed())return true;
@@ -410,13 +513,16 @@ export async function createEnvironment(options, context) {
         if(row.closed===true)continue;
         let handle=row.handle;
         if(!handle&&row.receiptFile)try{handle=(await readJson(row.receiptFile)).handle;}catch{}
-        if(!handle)return false;
+        if(!handle){if(artifactDownload(row))continue;return false;}
         if(row.controlPayload&&!lease.record.controlHandle)await lease.update({controlHandle:handle});
         handles.add(handle);
       }
       // Re-observe exact identities; neither PID disappearance nor a fresh job is proof.
       for(const handle of handles)if((await environment.observe(handle,{signal:budget.signal})).state!=='stopped')return false;
-      if(budget.signal.aborted||!await reconcileHostLease(lease,budget))return finishClosed();
+      const released=lease.record.payloadHandle
+        ?await environment.readAdmission(lease.record.payloadHandle,{signal:budget.signal}):lease.record.submissions.find(row=>row.wrapperClosure?.admission?.token===lease.token)?.wrapperClosure.admission;
+      const positivelyReleased=released?.token===lease.token && released.decision==='admitted' && released.released===true;
+      if(budget.signal.aborted||!positivelyReleased&&!await reconcileHostLease(lease,budget))return finishClosed();
       await releaseLease(lease);return true;
     } catch(error) {
       // Positive token closure also covers a peer archiving during native I/O.
@@ -476,10 +582,38 @@ export async function createEnvironment(options, context) {
     for(const entry of entries)if(entry.isDirectory())
       await cp(join(journal,entry.name),join(context.instancePath,'.executions',entry.name),{recursive:true});
   }
+  async function retainedClosure(physical,proof) {
+    if(proof?.receipt===undefined)return null;
+    if(typeof proof.token!=='string'||!proof.token)throw new Error('Retained reservation token required');
+    const closed=await closedDeviceLease(proof.receipt,proof.token);
+    if(!closed)return null;
+    if(closed.pool!==pool||closed.physicalDevice!==physical)
+      return {closed:false,reason:'ownership-changed',receipt:proof.receipt,token:proof.token};
+    return {closed:true,receipt:proof.receipt,token:proof.token,
+      ...(closed.unresolvedArtifacts?{unresolvedArtifacts:closed.unresolvedArtifacts}: {})};
+  }
   async function recoverReservation(physical,proof={}) {
     const budget=cleanupBudget();
-    try{return await reconcileDeviceLease(deviceLeaseReceipt(pool,physical,context.leaseDirectory),{
+    const receipt=proof.receipt??deviceLeaseReceipt(pool,physical,context.leaseDirectory);
+    // A displaced receipt may be reconciled in place, never restored over the
+    // active reservation. Bind its identity before any native cleanup request.
+    const matches=record=>record.pool===pool&&record.physicalDevice===physical&&record.token===proof.token;
+    if(proof.receipt!==undefined){
+      const closed=await retainedClosure(physical,proof);
+      if(closed)return closed;
+      const record=await readJson(receipt);
+      if(!matches(record))return {closed:false,reason:'ownership-changed',receipt,token:proof.token};
+    }
+    if(proof.receipt===undefined){
+      let retained;try{retained=await readJson(receipt);}catch(error){if(error.code!=='ENOENT')throw error;}
+      if(retained?.cleanup){
+        await resumeDeviceCleanup(retained.cleanup.directory??cleanupQueue,{launch:context.cleanupLaunch});
+        return {closed:false,reason:retained.cleanup.deadline>Date.now()?'cleanup-pending':'cleanup-expired',receipt,token:retained.token};
+      }
+    }
+    try{return await reconcileDeviceLease(receipt,{
       ...proof,
+      stopped:(owner,record)=>(proof.receipt===undefined||matches(record))&&(proof.stopped??ownerStopped)(owner,record),
       observe:handle=>local?environment.observe(handle,{signal:budget.signal}):client(['observe',handle],{signal:budget.signal}),
       reconcileHost:async lease=>{
         // Administrative migration is separate from a failed receipt download.
@@ -502,17 +636,60 @@ export async function createEnvironment(options, context) {
     ...environment, resources, inspectDevices,
     reconcileReservation:(physical,proof)=>serial(async()=>{
       if(!Number.isInteger(physical)||physical<0)throw new Error('Physical device required');
+      if(pool){const closed=await retainedClosure(physical,proof);if(closed)return closed;}
       await enabled();return recoverReservation(physical,proof);
     }),
-    reconcileLease:()=>commandActive?Promise.resolve(false):reconcileLease(), shellOnTarget:local,
+    async retirePrePayloadCustody({receipt,token,fence}){
+      if(commandActive)return {closed:false,reason:'command-active'};
+      const retained=await readJson(leasePath).catch(error=>{if(error.code!=='ENOENT')throw error;return null;});
+      if(retained&&(retained.receipt!==receipt||retained.token!==token))return {closed:false,reason:'ownership-mismatch'};
+      const proof=await retirePrePayloadLease({receipt,token,fence,instancePath:context.instancePath},{observe:handle=>environment.observe(handle)});
+      if(proof.closed&&retained){if((await readJson(leasePath)).token!==token)throw Error('Lease ownership changed');await unlink(leasePath);}
+      return proof;
+    },
+    reconcileLease:async()=>commandActive?false:Boolean(await deferClosedLease())||reconcileLease(), shellOnTarget:local,
     async observe(handle,settings){
       const result=await environment.observe(handle,settings);
-      if(result.state==='stopped'&&!commandActive)await reconcileLease();
+      if(result.state==='stopped'&&!commandActive&&!await deferClosedLease())await reconcileLease();
       return result;
     },
+    async cleanupCustody({events}){
+      const proofs=[];
+      for(const {data}of events.filter(e=>e.type==='device-lease-acquired')){
+        if(typeof data.receipt!=='string'||typeof data.token!=='string')continue;
+        const closed=await closedDeviceLease(data.receipt,data.token);
+        if(!closed)continue;
+        const handles=[...new Set(events.filter(e=>e.type==='execution-handle'&&
+          e.data.purpose==='device-lease-control'&&closed.handles?.includes(e.data.handle)).map(e=>e.data.handle))];
+        if(handles.length)proofs.push({cleanup:{id:data.token,closedLease:{receipt:data.receipt,token:data.token}},handles});
+      }
+      return proofs;
+    },
     async reconcileOperation(operation){
-      const result=await environment.reconcileOperation(operation);
-      return {...result,closed:result.closed && await reconcileLease()};
+      const controls=operation.events.filter(e=>e.data.purpose==='device-lease-control'&&
+        (e.data.operation===operation.operation||e.data.submission===operation.operation));
+      const submissions=operation.events.filter(e=>e.type==='execution-submitting'&&
+        (e.data.operation===operation.operation||e.data.submission===operation.operation));
+      const controlOnly=submissions.length>0&&submissions.every(e=>e.data.purpose==='device-lease-control');
+      const result=await blockedBeforePayload(operation)??await environment.reconcileOperation({...operation,
+        events:controlOnly?operation.events:operation.events.filter(e=>e.data.purpose!=='device-lease-control')});
+      if(result.wrapperClosures?.length){
+        try{
+          const retained=await readJson(leasePath),lease=await openDeviceLease(retained.receipt,retained.token);
+          for(const proof of result.wrapperClosures)if(await lease.confirmSubmissionClosed(proof))
+            await context.event('execution-wrapper-closed',{submission:proof.submission,receiptFile:proof.receiptFile,token:lease.token,nativeIdentityMissing:true});
+        }catch(error){if(error.code!=='ENOENT')throw error;}
+      }
+      if(!result.closed)return result;
+      const cleanup=!commandActive?await retainBackgroundCustody(operation.events):null;
+      if(!cleanup&&!controlOnly&&controls.some(e=>e.type==='execution-submitting')){
+        const controlProof=await environment.reconcileOperation({...operation,events:operation.events.filter(e=>
+          e.data.purpose==='device-lease-control'||['execution-submitted','execution-not-admitted','execution-state'].includes(e.type))});
+        if(!controlProof.closed)return {...result,closed:false};
+      }
+      const closed=Boolean(cleanup)||await reconcileLease();
+      const deferredHandles=cleanup?[...new Set(controls.map(e=>e.data.handle).filter(Boolean))]:[];
+      return {...result,...(cleanup?{cleanupPending:cleanup,deferredHandles}:{}),closed};
     },
     instructions:environment.instructions+setupInstructions+(local?'\nBoth bash and rsi_target execute in the persistent local workspace through the same device admission, masks and execution supervision.':''),
     async execute(command, cwd, opts = {}) {
@@ -537,7 +714,22 @@ export async function createEnvironment(options, context) {
       }
       activeExclude=exclude;
       return await serial(async () => {
-        if(!await reconcileLease())throw new Error('Device lease unresolved; observe retained handles before retry');
+        if(asyncCleanup){
+          await resumeDeviceCleanup(cleanupQueue,{launch:context.cleanupLaunch});
+          try{const retained=await readJson(leasePath),record=await readJson(retained.receipt);
+            if(record.token===retained.token&&record.cleanup){await unlink(leasePath);}
+          }catch(error){if(error.code!=='ENOENT')throw error;}
+        }
+        const deferred=await deferClosedLease();
+        if(!deferred&&!await reconcileLease()){
+          let reservation;
+          try{reservation=await readJson(leasePath);}catch(error){
+            if(error.code!=='ENOENT')throw error;
+            reservation={receipt:leasePath};
+          }
+          throw Object.assign(new Error('Device lease unresolved; observe retained handles before retry'),
+            {code:'RSI_EXECUTION_UNRESOLVED',reservations:[reservation]});
+        }
         for(;;){
         let physical, lease;
         await preflight(async emit => {
@@ -557,14 +749,14 @@ export async function createEnvironment(options, context) {
                 if(proof.closed){
                   await context.event('device-lease-reconciled',{pool,physicalDevice:row.physical_device,...proof});
                   lease=await reserveDevice(pool,row.physical_device,context.leaseDirectory,{instancePath:context.instancePath});
-                }else if(!['owner-active','reconciliation-active','ownership-changed'].includes(proof.reason))blocked.push({physicalDevice:row.physical_device,...proof});
+                }else if(!['owner-active','reconciliation-active','ownership-changed','cleanup-pending'].includes(proof.reason))blocked.push({physicalDevice:row.physical_device,...proof});
               }
               if (lease) { physical = row.physical_device; break; }
             }
             if (lease) break;
             if(blocked.length){
               await context.event('device-lease-blocked',{pool,reservations:blocked});
-              throw Object.assign(new Error('Device reservations require reconciliation: '+JSON.stringify(blocked)),{code:'DEVICE_LEASE_BLOCKED'});
+              throw Object.assign(new Error('Device reservations require reconciliation: '+JSON.stringify(blocked)),{code:'DEVICE_LEASE_BLOCKED',reservations:blocked});
             }
             await waitForDevice();
             await exclude('queue-wait', () => delay(options.leasePollMs ?? 250, undefined, {signal}));
@@ -590,13 +782,22 @@ export async function createEnvironment(options, context) {
           });
           const {result,admission}=measured;
           if(!result.settled)return result;
-          if(admission?.token!==lease.token)return {...result,settled:false,admissionUnknown:true};
+          if(admission?.token!==lease.token){
+            if(asyncCleanup){const cleanup=await deferCleanup(lease);return {...result,cleanupPending:cleanup,admissionUnknown:true,
+              outcome:{kind:'infrastructure',reason:'device-admission-unavailable'}};}
+            activeLease=null;
+            return {...result,settled:await reconcileClosedPayload(),admissionUnknown:true,
+              outcome:{kind:'infrastructure',reason:'device-admission-unavailable'}};
+          }
           if(measured.queueWait){
             excludedMs+=performance.now()-attemptStarted-(excludedMs-attemptExcluded);
             await context.event('execution-state',{handle:result.handle,state:'stopped',executionSeconds:0,accountingExcluded:true});
           }
           if(['contended','health-refused'].includes(admission.decision)){
             await releaseLease(lease);
+          } else if(asyncCleanup){
+            if(admission.decision==='admitted'&&admission.released===true)await releaseLease(lease);
+            else{const cleanup=await deferCleanup(lease);return {...result,admission,cleanupPending:cleanup};}
           } else {
             activeLease=null;
             if(!await reconcileClosedPayload())return {...result,settled:false,admissionUnknown:true};

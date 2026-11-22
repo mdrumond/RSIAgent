@@ -125,3 +125,65 @@ If an evaluator defect is found, preserve the original result and identify the
 corrected evaluator revision in a separate measurement. Do not supply diagnostic
 grading details to a learning agent. The included T102 correction is explicitly
 opt-in, source-hash-bound, and disabled by the standard example.
+
+### Rebuild failure planning without deleting evidence
+
+Checkpoint campaign, skill and memory writers first. `failures` maintenance
+refuses live writers or unsettled comparisons. Retain a storage snapshot before
+applying operator maintenance. No queue action retires an underlying failure.
+
+Supply an operator JSON file with `action: "rebuild-audit"`, a unique `id`,
+`operator.reason`, and at most five distinct `seeds`. Each seed names its `id`,
+`objective` (`correctness` or `optimization`), active `groupIds`, exact
+`evidenceRefs`, and either an approved `proposal` or a bounded `question`,
+`requiredEvidence`, and `learningTarget` (`cpu` or `device`). The audit reports
+actual case readiness and independent project/attempt counts. Update proposals
+require ready evaluation cases; otherwise submit a bounded learning question
+for the missing cases. The audit rejects unready updates before changing state. Unclassified
+claims of skill benefit are not proof. Harness incidents remain human work.
+Known infrastructure-blocked learning requests can be annotated explicitly as
+`openInfrastructureBlocked: [{requestId, diagnosis, evidenceRefs}]`; they remain
+open in the audit and stored archive, including inconclusive child findings.
+
+Run `node cli/main.mjs failures --instance INSTANCE --config operator.json`.
+Inspect the returned snapshot, seed order, retained active/inconclusive requests,
+and signature. Copy the signature to `auditSignature`, change only `action` to
+`rebuild`, and run the same command. A changed snapshot requires another audit.
+The archive retains original queued/learning/review drafts, pending requests,
+cohort and continuation metadata. Active projects and completed/accepted runs
+remain intact. A new queue epoch prevents archived proposals from reviving;
+analysis focuses on the selected groups and failures arriving after the rebuild.
+Targets, campaign budgets, outcomes and workload quotas are unchanged.
+
+Ordinary curriculum and KDB retrieval omit retired/quarantined harness-only
+attention; history remains available with `include_retired` for native KDB or
+`includeRetired` for project summaries, tagged with its attention status. A/B
+pairs pin their attention revision; existing in-flight evaluations preserve
+revision zero and their original identity.
+
+
+Storage memory keeps exact attempt provenance separately from immutable indexed
+content. Before applying retirement to an older deployed knowledge database,
+run `failures` with `{"action":"refresh-memory-provenance"}` after checkpointing
+writers and settling active comparisons/learning. This public operation starts
+or reconnects the native KDB service, re-stages the active retained Git manifest,
+and backfills exact `attempt_id`/kind metadata without changing collection hashes,
+Git history, or the active generation. It reports `unknownProvenance` record IDs;
+records lacking exact retained provenance stay searchable. Positive lessons and
+attempts containing useful verification observations remain visible. No attempt
+identity is inferred from lesson text.
+# Attempt control files
+
+Attempt summaries inspect evidence with Pi's read, grep, find and ls tools;
+controller files and native session logs are not a summary's editable workspace.
+Investigation construction retains its coding tools in the investigation directory.
+
+The controller checkpoints job metadata in SQLite before publishing its file
+mirror. Missing or stale mirrors recover from that exact trusted checkpoint,
+preserving resource assignments, options and elapsed state. A checkpoint older
+than a portable binding cannot restore source-side metadata at the destination.
+
+For legacy attempts with no trusted checkpoint, `status.metadataBlocked` identifies
+the affected attempt. Scheduling other work continues, but the affected outcome
+and execution custody are preserved. Restore the original metadata from retained
+evidence; do not invent a replacement job or renew its elapsed allowance.

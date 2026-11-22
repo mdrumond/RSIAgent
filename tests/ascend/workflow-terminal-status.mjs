@@ -8,11 +8,12 @@ import {tmpdir} from 'node:os';
 import {ModelRuntime} from '@earendil-works/pi-coding-agent';
 import {InMemoryCredentialStore} from '@earendil-works/pi-ai';
 import {State} from '../../controller/state.mjs';
+import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {runAttempt} from '../../controller/pi.mjs';
 import {stages} from '../../controller/workflow.mjs';
 import {createEnvironment} from '../../integrations/environments/index.mjs';
 
-for(const scenario of ['premature-text','final-tool','source-changed'])test(scenario,{timeout:15000},async()=>{
+for(const scenario of ['premature-text','final-tool','source-changed','blocked'])test(scenario,{timeout:15000},async()=>{
   const root=await mkdtemp(join(tmpdir(),'workflow-terminal-')),state=new State(':memory:'),calls=[],wire=[];
   const source=join(root,'source');await mkdir(source);await writeFile(join(source,'answer.py'),'answer=42\n');
   const verifier=join(root,'verify.py');await writeFile(verifier,"import runpy\nassert runpy.run_path('answer.py')['answer']==42\nprint('numeric passed')\n");
@@ -20,7 +21,14 @@ for(const scenario of ['premature-text','final-tool','source-changed'])test(scen
     if(scenario==='premature-text'&&stage==='acceptance')break;
     calls.push(['rsi_skill',{}]);
     if(['design','optimisation'].includes(stage))for(const kind of ['good','negative'])calls.push(['rsi_knowledge',{query:'evidence',kind}]);
-    if(stage==='validation')calls.push(['rsi_verify',{}]);
+    if(stage==='validation'){
+      calls.push(['rsi_verify',{}]);
+      if(scenario==='blocked'){
+        calls.push(['rsi_report_blocker',{category:'optimization',blocker:'The throughput target is unmet.',
+          nextQuestion:'Does the slowdown persist without data copies?'}]);
+        break;
+      }
+    }
     calls.push(['rsi_advance',{reflection:'Use the observed independent numeric result.'}]);
   }
   const server=createServer(async(req,res)=>{
@@ -36,7 +44,8 @@ for(const scenario of ['premature-text','final-tool','source-changed'])test(scen
   server.listen(0,'127.0.0.1');await once(server,'listening');
   try{
     const skillMap={};for(const stage of [...stages,'global-kdb']){skillMap[stage]=join(root,stage+'.md');await writeFile(skillMap[stage],'Use independent evidence.');}
-    state.add({id:'p',goal:'Return42',source,actor_seconds:30,verifier:{files:[verifier],command:'python3 ../verify.py'}});
+    state.add({id:'p',goal:'Return42',source,actor_seconds:30,verifier:{files:[verifier],command:'python3 ../verify.py',
+      ...(scenario==='blocked'?{performance_command:'python3 -c "raise SystemExit(1)"'}:{})}});
     const attempt=state.admit('p',{});
     const modelRuntime=await ModelRuntime.create({credentials:new InMemoryCredentialStore(),modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
     modelRuntime.registerProvider('terminal-fixture',{baseUrl:`http://127.0.0.1:${server.address().port}/v1`,models:[{id:'scripted',name:'Scripted',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});await modelRuntime.setRuntimeApiKey('terminal-fixture','fixture-only');
@@ -44,11 +53,33 @@ for(const scenario of ['premature-text','final-tool','source-changed'])test(scen
       environmentFactory:context=>createEnvironment({mode:'local'},context),knowledge:{search:async()=>({content:[],evidence:[]})},modelRuntime,model:modelRuntime.getModel('terminal-fixture','scripted')});
     const events=state.events(attempt.id),passed=scenario==='final-tool';
     assert.equal(outcome.accepted,passed);assert.equal(state.attempt(attempt.id).outcome,passed?'passed':'failed');
+    if(scenario==='blocked'){
+      const [verification]=state.queryEvents(attempt.id,{types:['verification']});
+      const report=state.queryEvents(attempt.id,{types:['actor-blocker-reported']})[0];
+      const reference='events:'+verification.sequence;
+      assert.equal(verification.data.correctness.passed,true);
+      assert.equal(verification.data.performance.passed,false);
+      assert.equal(report.data.categoryHypothesis,'optimization');
+      assert.ok(report.data.evidenceRefs.includes(reference));
+      assert.deepEqual(report.data.passedChecks,[{reference,check:'correctness',sourceFingerprint:verification.data.fingerprint}]);
+      assert.equal(report.data.nextQuestion,'Does the slowdown persist without data copies?');
+      assert.deepEqual(events.find(e=>e.type==='rejected').data.actorStatus,{kind:'ended',report:'submitted'});
+      const backlog=new SkillBacklog(state,{target:'a5'});backlog.ingest();
+      const group=backlog.failures().find(row=>row.type==='verification');
+      assert.equal(group.linkedDiagnostics.find(row=>row.type==='actor-blocker-reported').reference,'events:'+report.sequence);
+      assert.equal(events.some(e=>e.type==='accepted'),false);
+      return;
+    }
+    assert.equal(events.some(e=>e.type==='actor-blocker-reported'),false);
     assert.equal(events.find(e=>e.type==='verification').data.passed,true);
     assert.equal(wire.find(result=>result.stage==='acceptance').accepted,false);
     assert.ok(wire.filter(result=>result.stage).every(result=>result.accepted===false));
     assert.equal(wire.some(result=>result.accepted===true),scenario!=='premature-text');
     assert.equal(events.some(e=>e.type==='accepted'),scenario!=='premature-text');
-    if(!passed)assert.equal(events.find(e=>e.type==='rejected').data.reason,scenario==='premature-text'?'actor-ended-without-workflow-acceptance':'source-changed-after-workflow-acceptance');
+    if(!passed){
+      const rejection=events.find(e=>e.type==='rejected').data;
+      assert.equal(rejection.reason,scenario==='premature-text'?'actor-ended-without-workflow-acceptance':'source-changed-after-workflow-acceptance');
+      assert.deepEqual(rejection.actorStatus,{kind:'ended',report:'missing'});
+    }
   }finally{server.closeAllConnections();await new Promise(ok=>server.close(ok));state.close();await rm(root,{recursive:true,force:true});}
 });

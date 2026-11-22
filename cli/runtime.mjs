@@ -1,6 +1,6 @@
 import {phaseActorSeconds} from '../controller/budget.mjs';
 import { spawn } from 'node:child_process';
-import { open, mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { open, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -12,23 +12,21 @@ import { State } from '../controller/state.mjs';
 import {terminalExecutionProofs,excludedExecutionProofs} from '../controller/execution-proof.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,outcomeRecorded } from '../controller/recovery.mjs';
-import { readConfig,updateConfigImmediate as updateConfig,importProject } from './instance.mjs';
+import { readConfig,updateConfigImmediate as updateConfig } from './instance.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
 import { tuningTask, environmentBinding } from '../controller/skill-evidence.mjs';
 import {skillWorker} from './skill-worker.mjs';
+import {skillPromotionPending} from './skill-promotion-gate.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
 import {projectCatalogExtension} from './project-catalog.mjs';
+import {writeAttemptJob,readAttemptJob,availableAttemptJob} from './attempt-job.mjs';
+import {migrateForegroundCheckpoint} from './foreground-resource.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const policy=config=>({mode:config.mode,inferenceRecovery:config.recovery!==false,
   maxFailedRounds:config.failed_recovery_rounds??5,investigationSeconds:config.investigation_seconds??9600});
 const stateFor=root=>new State(join(root,'state.sqlite'));
-async function writeJob(path,value) {
-  const temporary=path+'.'+randomUUID()+'.tmp';
-  await writeFile(temporary,JSON.stringify(value),{mode:0o600,flag:'wx'});
-  await rename(temporary,path);
-}
 function control(state) {
   state.db.exec('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)');
   return {
@@ -43,7 +41,7 @@ function resumesCampaign(ctl) {
 }
 async function environment(config,path,event,exclude,resource,signal) {
   const module=await import(pathToFileURL(resolve(config.root,config.environment.module)));
-  return module.createEnvironment({...config.environment.options,localExecution:config.local_execution},{instancePath:path,event,exclude,resource,signal});
+  return module.createEnvironment({...config.environment.options,localExecution:config.local_execution},{instancePath:path,event,exclude,resource,signal,campaignRoot:config.root});
 }
 export async function instanceStopped(config) {
   const state=stateFor(config.root),ctl=control(state);
@@ -53,6 +51,7 @@ export async function instanceStopped(config) {
     }
     for(const row of state.db.prepare('SELECT owner FROM attempts').all())
       if(!await ownerStopped(row.owner))return false;
+    if(await (await import('../integrations/environments/device-cleanup.mjs')).campaignCleanupPending(config.root))return false;
     if(ctl.get('skill-background-resource') &&
       !await (await import('./skill-background.mjs')).backgroundSkillsSettled(config))return false;
     return true;
@@ -60,6 +59,8 @@ export async function instanceStopped(config) {
 }
 
 export async function operate(command,config,options={}) {
+  if(['wave','resume'].includes(command)&&config.skills?.failureFirst?.enabled&&config.skills.background&&!config.skills.tuningDisabled)
+    throw new Error('Stop the four-device skills-ab worker before resuming foreground work');
   if(config.binding_required&&['wave','resume'].includes(command))throw new Error('Bind the portable campaign before execution');
   if(options.signal?.aborted)throw new Error('Wave interrupted');
   config={...config,mode:options.mode==='revisit'?config.mode:(options.mode??config.mode),
@@ -161,7 +162,8 @@ export async function operate(command,config,options={}) {
         const signal=schedulerAbort.signal;
         try {
           const path=join(config.root,'attempts',attempt.id);
-          const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
+          const job=await availableAttemptJob(state,config.root,attempt.id);
+          if(!job)continue;
           const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
             async(_label,fn)=>fn(),job.resource,signal);
           if(!failureSettled(state,attempt.id))await reconcileFailure(state,attempt.id,previous);
@@ -190,7 +192,7 @@ export async function operate(command,config,options={}) {
     const finalize=state.db.prepare(`SELECT a.* FROM attempts a WHERE outcome IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed')`)
       .all().filter(attempt=>failureSettled(state,attempt.id));
-    const jobs=[];
+    let jobs=[];
     for(const attempt of finalize)if(await ownerStopped(attempt.owner))
       jobs.push({attempt,projectId:attempt.project,resume:true,finalize:true});
     jobs.push(...(command==='resume'
@@ -201,9 +203,10 @@ export async function operate(command,config,options={}) {
           return Array.isArray(selected)?selected.includes(job.projectId):(!job.project.spec.phase || job.project.spec.phase===config.mode);
         })));
     for(const job of jobs)if(job.resume) {
-      const manifest=JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8'));
-      Object.assign(job,{...manifest,...job});
+      const manifest=await availableAttemptJob(state,config.root,job.attempt.id);
+      if(manifest)Object.assign(job,{...manifest,...job});else job.metadataBlocked=true;
     }
+    jobs=jobs.filter(job=>!job.metadataBlocked);
     let access=await environment(config,join(config.root,'scheduler'),(type,data)=>state.event(null,type,data),async(_label,fn)=>fn(),undefined,schedulerAbort.signal);
     let environmentRevision=JSON.stringify(config.environment);
     const running=new Set();
@@ -238,15 +241,15 @@ export async function operate(command,config,options={}) {
       try {
       const prepare=async()=>{
       let pinnedMode=job.mode??config.mode;
-      if(job.origin_attempt&&!job.resume)pinnedMode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
-      const admitted=job.resume?{...JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy({...config,mode:pinnedMode})});
+      if(job.origin_attempt&&!job.resume)pinnedMode=(await readAttemptJob(state,config.root,job.origin_attempt)).mode;
+      const admitted=job.resume?{...await readAttemptJob(state,config.root,job.attempt.id),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy({...config,mode:pinnedMode})});
       admitted.mode=pinnedMode;
       admitted.actor_seconds=phaseActorSeconds(config,pinnedMode,admitted.actor_seconds);
       attempt=admitted.attempt;
       launchedAttempts.add(attempt.id);
       assignedResource=resource??admitted.resource;
       if(job.origin_attempt&&!job.resume) {
-        const parent=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8'));
+        const parent=await readAttemptJob(state,config.root,job.origin_attempt);
         admitted.mode=parent.mode;
       }
       if(job.failure_pattern) {
@@ -255,7 +258,7 @@ export async function operate(command,config,options={}) {
       }
       path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
       // Retain a finalization manifest even if subsequent launch preparation fails.
-      await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,
+      await writeAttemptJob(state,config.root,attempt.id,{...admitted,wave:admitted.wave??wave,
         options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,
         skillVersion:admitted.skillVersion??config.skills.activeVersion,resource:assignedResource,
         deferFinalization:options.continuous&&!job.finalize});
@@ -278,7 +281,7 @@ export async function operate(command,config,options={}) {
             (await (await import('../controller/storage-knowledge.mjs')).recordStorageSkill(latest,skillVersion,{state})).revision});
         await storage.register(join(path,'worker.log'),{attempt:attempt.id,project:attempt.project,kind:'worker-log',role:'controller'});
       }
-      await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
+      await writeAttemptJob(state,config.root,attempt.id,{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
         deferFinalization:options.continuous&&!job.finalize});
       return {argv:[process.execPath,self,'worker',config.root,attempt.id],cwd:config.root,
         env:{...process.env,...assignedResource?.env},
@@ -327,6 +330,10 @@ export async function operate(command,config,options={}) {
       config:()=>config,remaining:()=>campaignClock.remaining,
       event:(type,data)=>state.event(null,type,data),signal:backgroundAbort.signal,
     }):null;
+    const migrate=(job,resources)=>migrateForegroundCheckpoint({state,config,job,resources,reserved:tuning?.resource,
+      createEnvironment:resource=>environment({...config,environment:{...config.environment,
+        options:{...config.environment.options,asyncCleanup:false}}},join(config.root,'attempts',job.attempt.id),
+      (type,data)=>state.event(job.attempt.id,type,data),async(_label,fn)=>fn(),resource,schedulerAbort.signal)});
     const unavailable=new Set();let resourceWait;
     const keyFor=job=>job.attempt?`${job.finalize?'finalize':'attempt'}:${job.attempt.id}`:
       `${job.kind}:${job.projectId}:${job.kind==='original'?'':job.eligible_wave}`;
@@ -372,15 +379,18 @@ export async function operate(command,config,options={}) {
           .run(JSON.stringify({...existing.spec,campaign_entry:project.campaign_entry,phase:project.phase}),project.id);
       }
       if(config.campaign_plan)startCampaignEntry(state,config);
+      const promotionPending=skillPromotionPending(config);
       const progress=campaignProgress(state,config),snapshot=JSON.stringify(progress);
+      const priorityPending=options.continuous&&progress.done&&config.skills?.priority?.enabled&&
+        (await (await import('./skill-background.mjs')).backgroundSkillStatus(config)).hasWork;
       if(snapshot!==progressSnapshot){ctl.set('progress',progress);progressSnapshot=snapshot;}
       if(config.campaign_plan && progress.currentEntry)config=campaignEntryConfig(config,progress.currentEntry.id);
-      if(options.continuous&&config.campaign_plan&&progress.phaseComplete&&(!progress.done||!running.size)) {
+      if(!promotionPending&&options.continuous&&config.campaign_plan&&progress.phaseComplete&&(!progress.done||!running.size)&&!priorityPending) {
         advanceCampaignEntry(state,config);
         if(progress.done)break;
         continue;
       }
-      if(options.continuous&&!config.campaign_plan&&progress.nextMode) {
+      if(!promotionPending&&options.continuous&&!config.campaign_plan&&progress.nextMode) {
         await updateConfig(config.root,current=>({...current,mode:progress.nextMode}));
         state.event(null,'phase-advanced',{from:config.mode,to:progress.nextMode});
         config={...config,mode:progress.nextMode};continue;
@@ -389,7 +399,7 @@ export async function operate(command,config,options={}) {
       const generationEntry=currentCampaignEntry(state,config);
       const generationPhase=generationEntry?.phase??config.mode;
       const generationPolicy=generationSettings(config,generationPhase);
-      if(!memory?.blocked&&options.continuous&&!progress.phaseComplete&&generationPolicy.enabled&&!generation&&Date.now()>=nextGeneration) {
+      if(!promotionPending&&!memory?.blocked&&options.continuous&&!progress.phaseComplete&&generationPolicy.enabled&&!generation&&Date.now()>=nextGeneration) {
         const generationConfig=config;
         generation=(async()=>{
           try {
@@ -398,25 +408,10 @@ export async function operate(command,config,options={}) {
             const path=join(config.root,'curriculum','generation');await mkdir(path,{recursive:true});
             const bridge=createKdbBridge({url:await ensureKnowledgeService(generationConfig,{signal:backgroundAbort.signal}),attemptId:'generation-'+randomUUID(),agentDir:path,target:generationConfig.target,
               event:(type,data)=>state.event(null,type,{...data,role:'generation'})});
-            const specs=await (await import('./project-generation.mjs')).refillProjects({config:generationConfig,state,bridge,
-              concurrency:Math.max(1,ctl.get('actor-capacity')??1),path,signal:backgroundAbort.signal});
-            for(const spec of specs) {
-              backgroundAbort.signal.throwIfAborted();
-              if(generationConfig.campaign_plan&&currentCampaignEntry(state,generationConfig)?.id!==spec.campaign_entry)break;
-              if(state.project(spec.id))continue;
-              let imported;const packaging=await import('./project-generation.mjs');
-              try{imported=await importProject(config.root,spec,{signal:backgroundAbort.signal,localExecution:config.local_execution,
-                checkpoint:seconds=>packaging.checkpointGeneratedBundle(state,spec,seconds)});}
-              catch(error){
-                if(!backgroundAbort.signal.aborted)packaging.rejectGeneratedProject(state,spec,error);
-                throw error;
-              }
-              await updateConfig(config.root,(current,ledger)=>{
-                if(!ledger.project(imported.id))ledger.add(imported);
-                return {...current,projects:[...current.projects.filter(p=>p.id!==imported.id),imported],
-                  curriculum:{...current.curriculum,[generationPhase]:[...new Set([...(current.curriculum?.[generationPhase]??[]),imported.id])]}};
-              });
-            }
+            const packaging=await import('./project-generation.mjs');
+            await packaging.refillProjects({config:generationConfig,state,bridge,
+              concurrency:Math.max(1,ctl.get('actor-capacity')??1),path,signal:backgroundAbort.signal,
+              onReady:spec=>packaging.publishGeneratedProject({config:generationConfig,state,spec,signal:backgroundAbort.signal})});
           }catch(error){if(!backgroundAbort.signal.aborted)state.event(null,'generation-error',{message:error.message});}
           finally{nextGeneration=Date.now()+5000;generation=null;}
         })();
@@ -446,15 +441,25 @@ export async function operate(command,config,options={}) {
         WHERE outcome IS NOT NULL AND NOT EXISTS(SELECT 1 FROM events e
           WHERE e.attempt=a.id AND e.type='postprocess-completed')`).all()) {
         if(!failureSettled(state,attempt.id)||!await ownerStopped(attempt.owner))continue;
-        const manifest=JSON.parse(await readFile(join(config.root,'attempts',attempt.id,'job.json'),'utf8'));
+        const manifest=await availableAttemptJob(state,config.root,attempt.id);
+        if(!manifest)continue;
         maintenanceJobs.push({...manifest,attempt,projectId:attempt.project,resume:true,finalize:true});
       }
-      const candidates=command==='resume' && !options.continuous?jobs:
+      let candidates=command==='resume' && !options.continuous?jobs:
         [...maintenanceJobs,...jobs.filter(job=>job.resume),...nextWave(state,{wave:options.continuous?wave+1:wave,...policy({...config,mode:'phase1'})})];
-      for(const job of candidates)if(['investigation','retry'].includes(job.kind)&&!job.mode&&job.origin_attempt)
-        job.mode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
+      const ready=[];
+      for(const job of candidates) {
+        if(['investigation','retry'].includes(job.kind)&&!job.mode&&job.origin_attempt) {
+          const parent=await availableAttemptJob(state,config.root,job.origin_attempt);
+          if(!parent)continue;
+          job.mode??=parent.mode;
+        }
+        ready.push(job);
+      }
+      candidates=ready;
       const eligible=candidates.filter(job=>{
         const key=keyFor(job);
+        if(promotionPending&&!job.finalize)return false;
         if(config.campaign_plan&&!job.finalize&&!job.resume) {
           if(progress.done&&(options.continuous||job.kind==='original'))return false;
           if(job.kind==='original' && (job.project.spec.campaign_entry!==progress.currentEntry?.id ||
@@ -484,6 +489,13 @@ export async function operate(command,config,options={}) {
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
         try{await tuning.poll(slots,activeActors.length,limit,{admit:!memory?.blocked&&memory?.limit!==1});}
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
+        if(promotionPending&&tuning.resource)for(const job of candidates.filter(job=>job.resume&&!job.finalize)){
+          const moved=await migrate(job,slots);if(moved)job.resource=moved;
+        }
+      }
+      if(promotionPending) {
+        ctl.set('wait',{reason:'skill-update-required',baseVersion:config.skills.promotionGate.baseVersion,at:new Date().toISOString()});
+        await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);continue;
       }
       const foregroundLimit=Math.min(limit,tuning?.capacity??limit)-(tuning?.reserved?1:0);
       if(memory?.limit===1&&tuning?.reserved&&tuning.capacity>0&&foregroundLimit<1) {
@@ -497,7 +509,7 @@ export async function operate(command,config,options={}) {
         running:activeActors,concurrency:foregroundLimit,freshSinceRecovery}):null;
       if(!job) {
         if(!running.size&&!options.continuous&&!resourceWait)break;
-        if(options.continuous&&progress.done&&!running.size&&!maintenance&&!generation&&
+        if(options.continuous&&progress.done&&!priorityPending&&!running.size&&!maintenance&&!generation&&
           !eligible.some(job=>job.finalize||['investigation','retry'].includes(job.kind)))break;
         ctl.set('wait',resourceWait??{reason:running.size?'actor-capacity':config.campaign_plan?'waiting-inputs':'inputs-or-recovery',at:new Date().toISOString()});
         await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);unavailable.clear();continue;
@@ -523,7 +535,13 @@ export async function operate(command,config,options={}) {
       }
       ctl.set('actor-capacity',Math.min(resources.filter(r=>r.available).length,limit));
       if(resources[0]?.metadata?.pool)ctl.set('target-pool',resources[0].metadata.pool);
-      const prior=job.resume?JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')).resource:null;
+      const retained=job.resume?await availableAttemptJob(state,config.root,job.attempt.id):null;
+      if(job.resume&&!retained){unavailable.add(keyFor(job));continue;}
+      let prior=retained?.resource??null;
+      if(job.resume&&tuning?.reserved&&prior?.id===tuning.resource?.id) {
+        const migrated=await migrate(job,resources);
+        if(migrated)prior=migrated;
+      }
       const choose=()=>resources.find(r=>r.available && (!config.resource_ids || config.resource_ids.includes(r.id)) && (job.resume?r.id===prior?.id:
         !state.db.prepare('SELECT 1 FROM resource_leases WHERE resource=?').get(r.id)) && r.id!==tuning?.resource?.id);
       const resource=choose();
@@ -604,7 +622,7 @@ export async function stopWorkerExecutions(state,id,environment) {
 
 async function worker(root,id) {
   let config=await readConfig(root);const state=stateFor(root),attempt=state.attempt(id);
-  const path=join(root,'attempts',id),job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
+  const path=join(root,'attempts',id),job=await readAttemptJob(state,root,id);
   config={...config,mode:job.mode??config.mode,recovery:job.options['no-recovery']?false:config.recovery};
   let env,bridge,url,stopping,interrupted=false,claimed=false,actorRunning=false;
   const abort=new AbortController(),ctl=control(state);
@@ -631,7 +649,13 @@ async function worker(root,id) {
     if(!url)url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:abort.signal});
     await (await import('./memory.mjs')).deliverLessons({config,state,queue:new RecoveryQueue(state,policy(config)),url,signal:abort.signal});
     state.event(id,'memory-updated',{});
-    if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
+    if(config.skills?.review?.enabled===true||config.skills?.priority?.enabled===true||config.skills?.failureFirst?.enabled===true)
+      (await import('../controller/skill-review.mjs')).recordLearningOutcome(state,state.project(current.project).spec,current);
+    if(config.skills?.priority?.enabled) {
+      // Failure journals already contain the evidence. No model/skill lock is
+      // required to make Phase 1, recovery and curriculum failures discoverable.
+      state.event(id,'skill-priority-evidence-ready',{phase:config.mode,kind:job.kind});
+    } else if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
       try {
         const task=tuningTask({state,attemptId:id,kind:job.kind,phase:config.mode});
         if(config.skills.background) {

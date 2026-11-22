@@ -1,0 +1,62 @@
+{
+  "schema": "skill-evaluation/v1",
+  "project": "interrupt-attribution",
+  "entrypoint": "verifier/verify.py",
+  "args": [],
+  "candidate_file": "attribution.py",
+  "description": "Attempt-interruption attribution: decide whether the six linked 'Attempt interrupted' events of a bucket were controller terminations or actor-ended attempts. The same command is executed with cwd set to each case directory; it must exit 0 for the reference and 1 for every control.",
+  "files": [
+    "verifier/verify.py",
+    "verifier/fixtures/cases.json",
+    "reference/attribution.py"
+  ],
+  "cases": [
+    {
+      "name": "reference",
+      "kind": "reference",
+      "path": "reference",
+      "expect": {
+        "exit": 0
+      },
+      "args": [
+        "--self-check"
+      ]
+    },
+    {
+      "name": "control-claim-mechanism-unified",
+      "kind": "negative",
+      "path": "negatives/claim_mechanism_unified",
+      "expect": {
+        "exit": 1
+      },
+      "args": []
+    },
+    {
+      "name": "control-wallclock-pairs",
+      "kind": "negative",
+      "path": "negatives/wallclock_pairs",
+      "expect": {
+        "exit": 1
+      },
+      "args": []
+    },
+    {
+      "name": "control-elapsed-tolerance-pruned",
+      "kind": "negative",
+      "path": "negatives/elapsed_tolerance_pruned",
+      "expect": {
+        "exit": 1
+      },
+      "args": []
+    },
+    {
+      "name": "control-no-pair-linkage",
+      "kind": "negative",
+      "path": "negatives/no_pair_linkage",
+      "expect": {
+        "exit": 1
+      },
+      "args": []
+    }
+  ]
+}

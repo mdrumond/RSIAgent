@@ -147,6 +147,22 @@ with open(c['spool']+'/exit','w') as f: f.write(str(code))
 with open(c['spool']+'/timing.json.tmp','w') as f:
  json.dump({'completed':True,'executionSeconds':time.monotonic()-started,'key':c['timingKey'],'outcome':outcome},f); f.flush(); os.fsync(f.fileno())
 os.replace(c['spool']+'/timing.json.tmp',c['spool']+'/timing.json')
+if c.get('inlineResult'):
+ with open(c['spool']+'/timing.json') as f: result=json.load(f)
+ result.update(protocol='rsi-command-result-1',exitCode=code if code>=0 else 128-code,inlineOutput=False,admission=None)
+ try:
+  if os.path.getsize(c['spool']+'/admission.json')<=4096:
+   with open(c['spool']+'/admission.json') as f: result['admission']=json.load(f)
+ except (OSError,ValueError): pass
+ if sum(os.path.getsize(c['spool']+'/'+name) for name in ['stdout','stderr'])<=32768:
+  try:
+   for name in ['stdout','stderr']:
+    with open(c['spool']+'/'+name,encoding='utf8',newline='') as f: result[name]=f.read()
+   result['inlineOutput']=len(json.dumps(result,ensure_ascii=False).encode())<=65536
+  except UnicodeError: pass
+  if not result['inlineOutput']:
+   result.pop('stdout',None); result.pop('stderr',None)
+ print(json.dumps(result,ensure_ascii=False),flush=True)
 sys.exit(code if code>=0 else 128-code)
 `;
 
@@ -230,15 +246,15 @@ export async function createEnvironment(options, context) {
   if (!remote && options.mode !== 'local') throw new Error('Environment mode must be local or cpl');
   let projectRoot, attemptRoot, projectLayout = 'project', frozen = [];
   let capabilities;
-  async function discoverCapabilities() {
+  async function discoverCapabilities(signal=context.signal) {
     if(!capabilities) {
-      const result=await client(['capabilities',options.target]);
+      const result=await client(['capabilities',options.target],{signal});
       if(result.state!=='available')throw closedSetupError('CPL target unavailable',{reason:result});
       capabilities=result;
     }
     return capabilities;
   }
-  const executionReceipts = new Map();
+  const executionReceipts = new Map(), terminalAttempts = new Set();
   const uploadParents = new Set();
   const instructions = (options.instructionFile ? await exclude('setup', () => readFile(options.instructionFile, 'utf8')) : '') +
     '\nNative bash/read/write/edit operate in the LOCAL project; use them for persistent source edits. rsi_target executes commands in the configured target environment.' +
@@ -329,6 +345,34 @@ export async function createEnvironment(options, context) {
     const {dir,...record}=receipt;await save(join(dir,'execution.json'),record);
     return {executionSeconds:timing.executionSeconds,timingSource:'controller-launch',timingEstimated:true};
   }
+  // Native terminal observation plus the wrapper's nonce permits replacing
+  // several small-file transfers; absent/older results retain file collection.
+  const validTerminal = (data,receipt) => data?.protocol==='rsi-command-result-1' &&
+    data.completed===true && data.key===receipt.timingKey && Number.isInteger(data.exitCode) &&
+    Number.isFinite(data.executionSeconds) && data.executionSeconds>=0 &&
+    ['command','infrastructure'].includes(data.outcome?.kind) &&
+    typeof data.inlineOutput==='boolean' && Object.hasOwn(data,'admission') &&
+    (data.admission===null || typeof data.admission==='object' && !Array.isArray(data.admission)) &&
+    (!data.inlineOutput || typeof data.stdout==='string' && typeof data.stderr==='string');
+  async function cachedTerminal(receipt) {
+    try {const data=await json(join(receipt.dir,'terminal-result.json'));return validTerminal(data,receipt)?data:null;}
+    catch {return null;}
+  }
+  async function terminalResult(handle,receipt,state,signal) {
+    if(state!=='stopped')return null;
+    const cached=await cachedTerminal(receipt);if(cached)return cached;
+    if(terminalAttempts.has(handle))return null;terminalAttempts.add(handle);
+    try {
+      const response=await client(['logs',handle,'--stream','stdout','--tail','1'],{signal});
+      if(typeof response.content!=='string'||Buffer.byteLength(response.content)>65536)return null;
+      const data=JSON.parse(response.content.trim());if(!validTerminal(data,receipt))return null;
+      await save(join(receipt.dir,'timing.json'),data);
+      if(data.admission!==null)await save(join(receipt.dir,'admission.json'),data.admission);
+      if(data.inlineOutput)for(const stream of ['stdout','stderr'])await writeFile(join(receipt.dir,stream),data[stream],{mode:0o600});
+      await save(join(receipt.dir,'terminal-result.json'),data);
+      return data;
+    }catch{return null;}
+  }
   async function executionTiming(handle, signal, state, legacy) {
     if (handle.includes(':transfer:')) return { executionSeconds: 0, accountingExcluded: true };
     let receipt = executionReceipts.get(handle);
@@ -347,6 +391,7 @@ export async function createEnvironment(options, context) {
     let fallback;
     try {fallback=receipt?await controllerTiming(receipt,state,legacy):null;} catch { /* accounting failure cannot change native process status */ }
     if (receipt?.timingKey && receipt.spool) {
+      await terminalResult(handle,receipt,state,signal);
       if(state==='stopped' && receipt.admissionToken){
         let admission;try {admission=await json(join(receipt.dir,'admission.json'));} catch {}
         if(admission?.token!==receipt.admissionToken)admission=await readAdmission(handle,{signal});
@@ -384,6 +429,8 @@ export async function createEnvironment(options, context) {
   }
   async function stop(handle, {accountingExcluded=false,signal:stopSignal=context.stopSignal}={}) {
     check(handle);
+    // A supplied cleanup signal owns its bounded allowance, independently of
+    // the interrupted body. Callers must bound it; absent one, allow five seconds.
     const signal = stopSignal??AbortSignal.timeout(5000);
     if (remote) {
       try { await client(['cancel', handle], {signal}); } catch { /* observe is authoritative */ }
@@ -402,15 +449,14 @@ export async function createEnvironment(options, context) {
         try { process.kill(-state.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       }
     }
-    const deadline = performance.now() + 5000;
-    while (performance.now() < deadline) {
+    while (!signal.aborted) {
       const state = await observe(handle, {signal,accountingExcluded});
-      if (state.state !== 'running') return state;
-      await delay(50);
+      if (state.state === 'stopped') return state;
+      try { await delay(50,undefined,{signal}); } catch { break; }
     }
     return { state: 'unknown' };
   }
-  async function submit(args, receipt, allowCompleted = false, accountingExcluded = false, signal = context.signal) {
+  async function submit(args, receipt, allowCompleted = false, accountingExcluded = false, signal = context.signal, receiptSignal = context.stopSignal) {
     const rejected = reason => {
       const error = closedSetupError(`CPL ${args[0]} was not admitted`, {notAdmitted:true,reason});
       // A refused artifact download says nothing about earlier payload closure.
@@ -421,7 +467,10 @@ export async function createEnvironment(options, context) {
     const operation = randomUUID();
     await event('execution-submitting', { submission: operation, receiptFile: receipt ?? null, kind: args[0], accountingExcluded });
     let result, cause;
-    try { result = await client(args, {signal}); }
+    if(signal?.aborted){await event('execution-not-admitted',{submission:operation,closed:true});throw Object.assign(rejected(),{cause:signal.reason});}
+    // Admission follows the actor clock; dispatched run receipts use the caller's
+    // independent bounded cleanup allowance before cancellation observes the ID.
+    try { result = await client(args, {signal:args[0]==='run'&&receiptSignal?receiptSignal:signal}); }
     catch (error) {
       cause = error;
       if (receipt) try { result = await json(receipt); } catch { /* absence is not closure */ }
@@ -581,9 +630,12 @@ export async function createEnvironment(options, context) {
         if (!receipt?.handle) throw new Error('Source synchronization submission unresolved; retain native receipt');
         const state = await observe(receipt.handle, {signal,accountingExcluded:true});
         if (state.state !== 'stopped') throw new Error(`Source synchronization unresolved; observe ${receipt.handle}`);
-        if (state.exitCode !== 0) { await rm(cachePath); throw closedSetupError(`Source synchronization failed: ${receipt.handle}`, {handle: receipt.handle, reason: state}); }
-        retained.confirmed = true;
-        await save(cachePath, retained);
+        if (state.exitCode !== 0) {
+          // The previous sync is positively closed. Retire its cache, never its
+          // native identity; this request stages current files into its new dir.
+          await event('source-staging-retired', {handle:receipt.handle,receiptFile:retained.receiptFile,reason:state,incoming:retained.incoming,key:retained.key});
+          await rm(cachePath);retained=null;
+        } else {retained.confirmed = true;await save(cachePath, retained);}
       }
       const reused = Boolean(snapshot.cacheable && retained?.confirmed && retained.key === key);
       let stage = reused ? retained : { key, cacheable: snapshot.cacheable,
@@ -607,7 +659,7 @@ export async function createEnvironment(options, context) {
       stage = { ...stage, confirmed: false, receiptFile: join(dir, 'sync-submission.json') };
       await save(cachePath, stage);
       let submitted;
-      try { submitted = await submit(args, stage.receiptFile, false, true, signal); }
+      try { submitted = await submit(args, stage.receiptFile, false, true, signal, opts.stopSignal); }
       catch (error) { if (error.code === 'CPL_NOT_ADMITTED') await rm(cachePath); throw error; }
       await event('execution-handle', { handle: submitted.handle, purpose: 'setup' });
       let state;
@@ -616,7 +668,7 @@ export async function createEnvironment(options, context) {
         if (state.state === 'stopped' && state.exitCode !== 0) {
           await rm(cachePath); throw closedSetupError(`Copy failed: ${submitted.handle}`, {handle: submitted.handle, reason: state});
         }
-        if (signal?.aborted) { await stop(submitted.handle,{accountingExcluded:true}); signal.throwIfAborted(); }
+        if (signal?.aborted) { await stop(submitted.handle,{accountingExcluded:true,signal:opts.stopSignal}); signal.throwIfAborted(); }
         if (state.state === 'running') await delay(options.pollMs ?? 250);
       } while (state.state === 'running');
       if (state.state !== 'stopped') throw new Error(`Copy unresolved: ${submitted.handle}`);
@@ -631,7 +683,7 @@ export async function createEnvironment(options, context) {
     const spool = posix.join(runRoot, 'output');
     const timingKey = randomUUID();
     const configuration = { command, timingKey, verifiers: ['verification', 'performance'].includes(opts.purpose) ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
-      spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...targetEnvironment(opts.env) }, timeout: remaining() ?? null };
+      spool: posix.join(options.workspacePath, spool), inlineResult:true, env: { ...options.env, ...targetEnvironment(opts.env) }, timeout: remaining() ?? null };
     if (opts.leaseReceipt) configuration.env.RSI_LEASE_RECEIPT = posix.join(configuration.spool,'admission.json');
     const script = join(dir, 'command.sh');
     const receipt = join(dir, 'submission.json');
@@ -642,7 +694,7 @@ export async function createEnvironment(options, context) {
     const launch={wallMs:Date.now(),monotonicNs:String(process.hrtime.bigint()),boot:(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim()};
     const receiptData = { handle: null, receiptFile: receipt, spool, timingKey, launch, admissionToken:opts.admissionToken, cwd: configuration.cwd };
     await save(join(dir, 'execution.json'), receiptData);
-    const submitted = await submit(args, receipt, false, false, signal);
+    const submitted = await submit(args, receipt, false, false, signal, opts.stopSignal);
     handle = submitted.handle;
     check(handle);
     receiptData.handle = handle;
@@ -661,7 +713,8 @@ export async function createEnvironment(options, context) {
       try {
         for (const stream of ['stdout', 'stderr']) {
           const path = join(dir, stream);
-          await copy('transfer', () => transfer(['download', options.target, posix.join(spool, stream), path], dir, signal));
+          if(!(await cachedTerminal({...receiptData,dir}))?.inlineOutput)
+            await copy('transfer', () => transfer(['download', options.target, posix.join(spool, stream), path], dir, signal));
           if (opts.onData) for await (const chunk of createReadStream(path)) opts.onData(chunk);
         }
         await event('execution-output', { handle, stdout: join(dir, 'stdout'), stderr: join(dir, 'stderr'), partial: false });
@@ -678,8 +731,8 @@ export async function createEnvironment(options, context) {
   // Token-scoped target protocol receipt; payload stdout/exit codes are not admission evidence.
   async function readAdmission(handle, {signal = context.signal} = {}) {
     check(handle);
-    let dir = !remote ? join(root,handle.slice(6)) : null, execution;
-    if (remote) for (const name of await readdir(root)) {
+    let execution=executionReceipts.get(handle),dir=!remote?join(root,handle.slice(6)):execution?.dir;
+    if (remote&&!dir) for (const name of await readdir(root)) {
       const candidate=join(root,name);
       try {
         const row=await json(join(candidate,'execution.json'));
@@ -688,15 +741,36 @@ export async function createEnvironment(options, context) {
       } catch { /* unrelated execution */ }
     }
     if(!dir) return null;
+    const cached=remote?await cachedTerminal({...execution,dir}):null;
+    if(cached)return cached.admission;
     const path=join(dir,'admission.json');
     try {
       if(remote) await exclude('transfer',()=>transfer(['download',options.target,posix.join(execution.spool,'admission.json'),path],dir,signal));
       return await json(path);
     } catch { return null; }
   }
+  // A lost transport ID remains unknown. The original nonce-bound wrapper and
+  // released admission token can nevertheless prove that its payload is closed.
+  async function wrapperClosure(data) {
+    if(!remote||data.kind!=='run'||data.accountingExcluded||!data.receiptFile)return null;
+    const dir=dirname(data.receiptFile),name=relative(root,dir);
+    if(!/^exec-[A-Za-z0-9]+$/.test(name)||data.receiptFile!==join(dir,'submission.json'))return null;
+    try{
+      const receipt=await json(join(dir,'execution.json'));
+      if(receipt.receiptFile!==data.receiptFile||receipt.handle||!receipt.timingKey||!receipt.admissionToken||!receipt.spool)return null;
+      for(const file of ['timing.json','admission.json','exit']){
+        const transferDir=await mkdtemp(join(root,'closure-'));
+        await exclude('transfer',()=>transfer(['download',options.target,posix.join(receipt.spool,file),join(dir,file)],transferDir,context.stopSignal??context.signal));
+      }
+      const timing=await json(join(dir,'timing.json')),admission=await json(join(dir,'admission.json')),exitText=(await readFile(join(dir,'exit'),'utf8')).trim(),exit=Number(exitText);
+      if(timing?.completed!==true||timing.key!==receipt.timingKey||!Number.isFinite(timing.executionSeconds)||timing.executionSeconds<0||!/^[-]?\d+$/.test(exitText)||!Number.isInteger(exit)||admission?.token!==receipt.admissionToken||admission.decision!=='admitted'||admission.released!==true)return null;
+      const proof={closed:true,receiptFile:data.receiptFile,timingKey:receipt.timingKey,admissionToken:receipt.admissionToken,admission,executionSeconds:timing.executionSeconds,exitCode:exit,nativeIdentityMissing:true,artifactsUnresolved:true};
+      await save(join(dir,'wrapper-closure.json'),proof);return proof;
+    }catch{return null;}
+  }
   async function reconcileOperation({ operation, events }) {
     const pending = events.filter(({ type, data }) => type === 'execution-submitting' && (data.operation === operation || data.submission === operation));
-    const handles = new Set();
+    const handles = new Set(),wrapperClosures=[],unresolvedArtifacts=[];
     if (!pending.length) return { closed: false, accountingUnresolved: true, handles: [] };
     let executionSeconds = 0,timingEstimated=false,closed=true,accountingUnresolved=false,accounted=false;
     const excluded=excludedExecutionProofs(events);
@@ -706,7 +780,14 @@ export async function createEnvironment(options, context) {
       if (response?.type === 'execution-not-admitted' || (response?.data.closed && data.accountingExcluded)) continue;
       let handle = response?.data.handle;
       if (!handle && data.receiptFile) try { handle = (await json(data.receiptFile)).handle; } catch { /* no identity is not closure */ }
+      if(data.kind==='download'&&data.accountingExcluded===true){
+        if(handle)check(handle);
+        if(!handle||!excluded.get(handle))unresolvedArtifacts.push({...data,...(handle?{handle}:{})});
+        continue;
+      }
       if (!handle) {
+        const proof=await wrapperClosure(data);
+        if(proof){wrapperClosures.push({...proof,submission:data.submission});executionSeconds+=proof.executionSeconds;accounted=true;continue;}
         closed=false;accountingUnresolved=true;
         if(!data.accountingExcluded) {
           let timing;
@@ -737,9 +818,14 @@ export async function createEnvironment(options, context) {
       }else accountingUnresolved=true;
       if(state.state!=='stopped')closed=false;
     }
-    return {closed:closed&&!accountingUnresolved,
+    // An excluded download is read-only: an unidentified transfer remains
+    // unresolved, while the operation itself cannot have launched a payload.
+    const artifactOnly=pending.every(({data})=>data.kind==='download'&&data.accountingExcluded===true);
+    const payloadClosed=closed&&!accountingUnresolved;
+    return {closed:payloadClosed,payloadClosed,...(artifactOnly?{payloadStarted:false}:{}),
+      ...(unresolvedArtifacts.length?{unresolvedArtifacts}:{}),
       ...((accounted||!accountingUnresolved)?{executionSeconds}:{}),
-      ...(timingEstimated?{timingEstimated}:{}),...(accountingUnresolved?{accountingUnresolved}:{}),handles:[...handles]};
+      ...(timingEstimated?{timingEstimated}:{}),...(accountingUnresolved?{accountingUnresolved}:{}),handles:[...handles],...(wrapperClosures.length?{wrapperClosures,nativeIdentityMissing:true,artifactsUnresolved:true}:{})};
   }
   // Installation eligibility only: never settles work or permits its resumption.
   async function canUpgrade({ attempt, events }) {
@@ -807,7 +893,8 @@ export async function createEnvironment(options, context) {
   return {
     instructions, execute, observe, stop, reconcileOperation, readAdmission,localOperations:local,
     ...(remote ? { canUpgrade } : {}),
-    async prepare({ project, attempt }) {
+    async prepare({ project, attempt, signal=context.signal }) {
+      signal?.throwIfAborted();
       return exclude('setup', async () => {
         if (remote) {
           if (!isAbsolute(options.workspacePath ?? '') || !options.remoteDirectory || isAbsolute(options.remoteDirectory) || options.remoteDirectory.split('/').includes('..')) throw new Error('Configure absolute registry workspacePath and relative task-owned remoteDirectory');
@@ -828,8 +915,8 @@ export async function createEnvironment(options, context) {
           for (const file of verifierFiles) frozen.push({ local: file,
             remote: posix.join(attemptRoot, 'tree', relative(layoutRoot, file)),
             sha256: createHash('sha256').update(await readFile(file)).digest('hex') });
-          await discoverCapabilities();
-          const preflight=await client(['preflight',options.target]);
+          await discoverCapabilities(signal);
+          const preflight=await client(['preflight',options.target],{signal});
           if(preflight.state!=='completed')throw closedSetupError('CPL preflight failed',{reason:preflight});
           if (frozen.length) await exclude('transfer', async () => {
             // One scoped tree transfer avoids one native transport/setup per
@@ -842,7 +929,7 @@ export async function createEnvironment(options, context) {
               await mkdir(dirname(destination), { recursive: true });
               await copyFile(file.local, destination);
             }
-            await transfer(['upload', options.target, tree, posix.join(attemptRoot, 'tree')], dir);
+            await transfer(['upload', options.target, tree, posix.join(attemptRoot, 'tree')], dir,signal);
           });
           await event('verifier-staged', { files: frozen.map(({ remote, sha256 }) => ({ path: remote, sha256 })) });
         }
@@ -851,7 +938,7 @@ export async function createEnvironment(options, context) {
       });
     },
     async resources(request) {
-      return context.resources ? context.resources(request) : remote ? [] : [{ id: 'local', available: true, metadata: {} }];
+      return context.resources ? context.resources(request) : remote ? [] : [{ id: options.localResourceId ?? 'local', available: true, metadata: {} }];
     },
     async browse(path) {
       if (!remote) return readdir(path, { withFileTypes: true }).then(entries => entries.map(entry => ({ name: entry.name, directory: entry.isDirectory() })));

@@ -1,3 +1,4 @@
+import {skillConfig} from '../controller/skill-context.mjs';
 import { readFile, access, appendFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -6,6 +7,7 @@ import { tune } from '../controller/skill-evolution.mjs';
 import {State} from '../controller/state.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import { tuningTask, skillEvents } from '../controller/skill-evidence.mjs';
+import {publishedPromotionGate} from './skill-promotion-gate.mjs';
 
 // Runtime module exports bootstrap({instanceRoot,config,sourceInstanceRoot,skillVersion})
 // and wave({instanceRoot,config,projectIds:[id],evaluation:true}). bootstrap must copy
@@ -23,7 +25,7 @@ export async function run(config, values = {}) {
   return await lock(config, async () => {
     values.signal?.throwIfAborted();
     const readConfig = values.readConfig ?? (await import('./instance.mjs')).readConfig;
-    config = { ...await readConfig(instanceRoot), root: instanceRoot };
+    config = skillConfig({ ...await readConfig(instanceRoot), root: instanceRoot });
     if (values.task || values.background) config.mode = executedMode;
     const action = values.config ? JSON.parse(await readFile(resolve(values.config), 'utf8')) : {};
     const task = values.task ?? action.task;
@@ -153,7 +155,9 @@ export async function publishSkillVersion(root,{active,candidate,signal}) {
       signal?.throwIfAborted();
       if(current.skills.activeVersion!==active)
         throw Object.assign(new Error('Active skills changed during evaluation'),{code:'SKILL_BASE_CHANGED'});
-      return {...current,skills:{...current.skills,activeVersion:candidate}};
+      const promotionGate=publishedPromotionGate(current.skills,{active,candidate});
+      return {...current,skills:{...current.skills,activeVersion:candidate,
+        ...(promotionGate?{promotionGate}:{})}};
     });
   } catch(error) {
     if(error.code==='SKILL_BASE_CHANGED')return null;

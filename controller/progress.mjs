@@ -152,8 +152,12 @@ function reconcilePlan(state, config) {
   }
   for (const project of config.projects ?? []) {
     const admitted = state.db.prepare('SELECT 1 FROM attempts WHERE project=? LIMIT 1').get(project.id);
+    // Resolve only this project's attempts, then seek their first admissions.
+    // Event-first ordering otherwise scans the entire telemetry ledger once per
+    // project while this transaction owns the campaign writer lock.
     const admission = admitted && state.db.prepare(`SELECT json_extract(e.data,'$.campaign_entry') entry
-      FROM events e JOIN attempts a ON a.id=e.attempt WHERE a.project=? AND e.type='job-admitted'
+      FROM attempts a JOIN events e ON e.sequence=(SELECT MIN(sequence) FROM events
+        WHERE attempt=a.id AND type='job-admitted') WHERE a.project=?
       ORDER BY e.sequence LIMIT 1`).get(project.id);
     if (admitted && (admission ? admission.entry ?? undefined : state.project(project.id)?.spec.campaign_entry) !== project.campaign_entry)
       throw new Error('Cannot change campaign_entry of an admitted project');

@@ -17,6 +17,7 @@ import { validateTargetBaseline } from './baseline-preflight.mjs';
 const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details:{}});
 const lifecycleEvents=new Set(['agent_start','agent_end','turn_start','turn_end','message_end',
   'tool_execution_start','tool_execution_end','auto_compaction_start','auto_compaction_end','auto_retry_start','auto_retry_end']);
+const blockerCategories=['harness','correctness','optimization','unknown'];
 
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
@@ -62,7 +63,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   const checkVerifier=await freezeFiles(project.verifier.files,project.source,project.verifier.hashes??previous?.data.hashes);
   if(!previous)event('verifier-frozen',{hashes:checkVerifier.manifest});
   await recordSkillContext({state,attemptId:attempt.id,project,verifierHashes:checkVerifier.manifest,environmentIdentity});
-  let session,timer,accepted=false,uncertain,telemetryFailure;
+  let session,timer,accepted=false,uncertain,telemetryFailure,lastModelStop,blockerReported=false;
+  const actorStatus=kind=>({kind,report:blockerReported?'submitted':'missing'});
   const nativeBash=new Map();
   const abort=()=>{void session?.abort();};
   signal?.addEventListener('abort',abort,{once:true});
@@ -155,6 +157,27 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       execute:async(_id,args,_signal,_onUpdate,ctx)=>result(await workflow.query(args.query,args.kind,ctx))});
     pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier in validation after completing all project edits. This tool stages trusted verifier files and executes the frozen numeric/performance commands; use it instead of invoking those command metadata strings through rsi_target. All project files, including documentation and receipts, affect the source fingerprint; later edits require revision and fresh verification. Returns retained controller-local evidence paths and SHA-256 digests: read these directly and keep post-validation receipts outside project source.',
       parameters:Type.Object({}),execute:async(_id,_args,nativeSignal)=>result(await workflow.validate(nativeSignal))});
+    pi.registerTool({name:'rsi_report_blocker',label:'Report an unresolved blocker',
+      description:'When you cannot finish the project, state the unresolved observation and one question that would help investigate it. The category is a hypothesis. The controller attaches its own evidence and passing checks.',
+      parameters:Type.Object({category:Type.Union(blockerCategories.map(value=>Type.Literal(value))),
+        blocker:Type.String({minLength:1,maxLength:1500}),nextQuestion:Type.String({minLength:1,maxLength:1000})}),
+      execute:async(_id,{category,blocker,nextQuestion})=>{
+        if(!blocker.trim()||!nextQuestion.trim())throw new Error('Provide a concrete blocker and next question');
+        const events=state.queryEvents(attempt.id,{types:['verification','baseline-preflight-completed',
+          'execution-unresolved','execution-settled','preactor-infrastructure'],order:'desc',limit:12});
+        const evidenceRefs=events.map(({sequence})=>'events:'+sequence);
+        const passedChecks=events.flatMap(({sequence,type,data})=>{
+          const reference='events:'+sequence;
+          if(type==='baseline-preflight-completed'&&data.passed===true)return [{reference,check:'target-baseline'}];
+          if(type!=='verification')return [];
+          return ['correctness','performance'].filter(check=>data[check]?.passed===true)
+            .map(check=>({reference,check,sourceFingerprint:data.fingerprint??null}));
+        });
+        event('actor-blocker-reported',{stage:workflow.stage,categoryHypothesis:category,
+          blocker:blocker.trim(),nextQuestion:nextQuestion.trim(),evidenceRefs,passedChecks});
+        blockerReported=true;
+        return result({recorded:true,evidenceRefs,passedChecks});
+      }});
     pi.registerTool({name:'rsi_advance',label:'Advance workflow',description:'Complete the current step and advance. Only accepted:true completes the workflow after the final acceptance gate; entering acceptance is not completion. Design and optimisation require reflection.',
       parameters:Type.Object({reflection:Type.Optional(Type.String())}),
       execute:async(_id,args)=>{
@@ -227,8 +250,10 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
         nativeBash.delete(e.toolCallId);
       }
       // Native session files retain model/tool content; this sidecar retains lifecycle telemetry.
-      if (e.type === 'message_end' && e.message.role === 'assistant' && e.message.stopReason === 'error')
-        diagnostics.push(e.message.errorMessage ?? 'Native provider error');
+      if (e.type === 'message_end' && e.message.role === 'assistant') {
+        lastModelStop=e.message.stopReason;
+        if(lastModelStop==='error')diagnostics.push(e.message.errorMessage ?? 'Native provider error');
+      }
       // Raw streams remain in provider.jsonl; SQL stores lifecycle labels only.
       if(storage&&!lifecycleEvents.has(e.type))return;
       try { telemetry(eventData({type:e.type,stage:workflow.stage,elapsed:clock.elapsed})); }
@@ -241,7 +266,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     },1000);
     if(signal?.aborted)throw new Error('Attempt interrupted');
     const gitGuidance=sourceGit?await readFile(new URL('../templates/skills/source-git.md',import.meta.url),'utf8'):'';
-    await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command metadata (executed by rsi_verify): ${project.verifier.command}\nFrozen performance command metadata (executed by rsi_verify): ${project.verifier.performance_command??'not required'}\nUse rsi_verify at validation to stage and run these frozen checks. Do not run their command strings through rsi_target or search the target filesystem for trusted verifier files: ordinary target commands start in editable source and their snapshot excludes trusted verifier files.\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project. Persist findings and evidence as local artifacts; the controller records KDB lessons after completion. Actor KDB access is retrieval-only: do not index repositories, submit lessons, or block the workflow on manual KDB writes.\n${gitGuidance}`);
+    await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command metadata (executed by rsi_verify): ${project.verifier.command}\nFrozen performance command metadata (executed by rsi_verify): ${project.verifier.performance_command??'not required'}\nUse rsi_verify at validation to stage and run these frozen checks. Do not run their command strings through rsi_target or search the target filesystem for trusted verifier files: ordinary target commands start in editable source and their snapshot excludes trusted verifier files.\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project. If you cannot finish, use rsi_report_blocker before ending. Describe the observation, classify it with the evidence available, and give one question that would help resolve it. Choose unknown if the evidence does not locate the problem. Persist findings and evidence as local artifacts; the controller records KDB lessons after completion. Actor KDB access is retrieval-only: do not index repositories, submit lessons, or block the workflow on manual KDB writes.\n${gitGuidance}`);
     await session.waitForIdle();
     await artifactWrites;
     if(artifactError)throw artifactError;
@@ -253,16 +278,20 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     if (accepted && workflow.validation.fingerprint !== await fingerprint(project.source)) {
       accepted=false;reason='source-changed-after-workflow-acceptance';
     }
-    if (!accepted) event('rejected',{stage:workflow.stage,reason,diagnostics,remaining:clock.remaining});
+    if (!accepted) event('rejected',{stage:workflow.stage,reason,diagnostics,remaining:clock.remaining,
+      actorStatus:actorStatus(!clock.remaining?'elapsed':lastModelStop==='error'?'provider-error':'ended')});
     state.finish(attempt.id,accepted?'passed':'failed',{settleProject});
     return {accepted,elapsed:clock.elapsed};
   } catch(error) {
     if(!session&&(['SETUP_CLOSED','CPL_NOT_ADMITTED','DEVICE_LEASE_BLOCKED'].includes(error.code)||error.diagnostic))
       event('preactor-infrastructure',{stage:workflow.stage,reason:error.code??'native-client-failed',message:error.message.slice(0,3000)});
-    event('attempt-error',{message:error.message,stage:error.code==='PROJECT_BASELINE_INVALID'?'baseline-preflight':workflow.stage});
+    const exitKind=signal?.aborted?'interrupted':uncertain?'execution-unresolved':
+      error.code==='ACTOR_ELAPSED_EXHAUSTED'?'elapsed':lastModelStop==='error'?'provider-error':'error';
+    event('attempt-error',{message:error.message,stage:error.code==='PROJECT_BASELINE_INVALID'?'baseline-preflight':workflow.stage,
+      ...(session?{actorStatus:actorStatus(exitKind)}:{})});
     state.checkpoint(attempt.id,clock.elapsed);
     if(error.code==='ACTOR_ELAPSED_EXHAUSTED' && !uncertain && !signal?.aborted) {
-      event('rejected',{stage:workflow.stage,reason:error.code});
+      event('rejected',{stage:workflow.stage,reason:error.code,actorStatus:actorStatus(exitKind)});
       state.finish(attempt.id,'failed',{settleProject});
       return {accepted:false,elapsed:clock.elapsed};
     }

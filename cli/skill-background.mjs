@@ -1,3 +1,4 @@
+import {skillConfig} from '../controller/skill-context.mjs';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -30,8 +31,13 @@ export function enqueueSkillEvidence(config, task) {
 }
 
 export async function backgroundSkillStatus(config) {
+  if(config.skills?.failureFirst?.enabled)return (await import('./skill-failure-campaign.mjs')).failureCampaignStatus(config);
   const evolution = await read(join(config.root, 'skills', 'evolution.json'));
   const archives = await evaluationArchiveStatus(config,evolution);
+  if(config.skills?.priority?.enabled&&!evolution?.pending){
+    const status=await (await import('./skill-priority.mjs')).prioritySkillStatus(config);
+    return {...status,archives,hasWork:status.hasWork||!config.skills?.tuningDisabled&&archives.hasWork};
+  }
   const pending = evolution?.pending;
   const round = pending && await read(join(pending.evaluationRoot, 'round.json'));
   const state = new State(join(config.root, 'state.sqlite'));
@@ -49,9 +55,12 @@ export async function backgroundSkillStatus(config) {
 // Used by scheduler settlement before returning a reserved slot to foreground work.
 export async function backgroundSkillsSettled(config, { runtime } = {}) {
   try {
+    if(config.skills?.failureFirst?.enabled)return (await import('./skill-failure-campaign.mjs')).failureCampaignSettled(config);
     if(!await evaluationArchivesSettled(config))return false;
     const evolution = await read(join(config.root, 'skills', 'evolution.json'));
     const pending = evolution?.pending;
+    if(config.skills?.priority?.enabled&&!pending)
+      return (await import('./skill-priority.mjs')).prioritySkillsSettled(config);
     if (!pending) return true;
     const round = await read(join(pending.evaluationRoot, 'round.json'));
     if (round?.runningAt === undefined) return true;
@@ -68,6 +77,8 @@ export async function backgroundSkillsSettled(config, { runtime } = {}) {
 // The campaign owns scheduling, device capacity and the decreasing remaining allocation.
 // One invocation handles one comparison, never recursively drains newer evidence.
 export async function runBackgroundSkills(config, values = {}) {
+  if(config.skills?.failureFirst?.enabled)throw Error('Use skills-ab for the four-device failure-first campaign while foreground is paused');
+  config=skillConfig(config);
   positiveSeconds(values.remainingSeconds);
   if (!values.resource?.id) throw new Error('Background evaluation requires a reserved resource');
   const deadline = new AbortController(), end = performance.now() + values.remainingSeconds * 1000;
@@ -87,6 +98,8 @@ export async function runBackgroundSkills(config, values = {}) {
     await enqueueCompletedEvaluation(config,evolution);
     await drainEvaluationArchives(config,{signal});
     const pending = evolution?.pending;
+    if(config.skills?.priority?.enabled&&!pending)
+      return (await import('./skill-priority.mjs')).runPrioritySkills(config,values);
     if (pending?.resource && values.resource?.id !== pending.resource.id)
       throw new Error('Resume skill evaluation on its retained resource');
     if (pending && !await backgroundSkillsSettled(config, { runtime: values.runtime }))

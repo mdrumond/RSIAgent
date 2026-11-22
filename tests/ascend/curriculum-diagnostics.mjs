@@ -20,12 +20,13 @@ async function fixture(t,plan) {
   const path=join(root,'attempt'),source=join(root,'original');
   await mkdir(path);await mkdir(source);await numericControls(join(path,'investigation'));
   await writeFile(join(source,'answer.py'),'answer=42\n');
-  const received=[],prompts=[];
+  const received=[],prompts=[],tools=[];
   let waiting;const waitStarted=new Promise(ok=>waiting=ok);
   const server=createServer(async(req,res)=>{
     let raw='';for await(const chunk of req)raw+=chunk;
     const body=JSON.parse(raw),results=body.messages.filter(m=>m.role==='tool');
     received.push(results);
+    tools.push(body.tools.map(tool=>tool.function.name));
     prompts.push(body.messages.filter(m=>m.role==='user').map(m=>typeof m.content==='string'?m.content:m.content.map(b=>b.text??'').join('\n')).join('\n'));
     const call=plan[results.length];
     if(call==='wait'){waiting();await new Promise(ok=>res.once('close',ok));return;}
@@ -46,7 +47,7 @@ async function fixture(t,plan) {
   const attempt=state.admit('p',{}),bridge={extension:()=>{},knowledge:{search:async({kind})=>({content:[{kind}],evidence:[]})}};
   const options={config,path,state,bridge,job:{origin_attempt:attempt.id,attempt,actor_seconds:120},base:{source,goal:'numeric'}};
   config.curriculum_seconds=1;
-  return {root,path,source,options,get events(){return state.events(attempt.id);},prompts,waitStarted,results:()=>received.at(-1)};
+  return {root,path,source,options,get events(){return state.events(attempt.id);},prompts,tools,waitStarted,results:()=>received.at(-1)};
 
 }
 
@@ -64,7 +65,7 @@ test('elapsed abort retains real session and summary reads it when actor session
   const rows=(await readFile(session.session,'utf8')).split('\n').filter(Boolean).map(JSON.parse);
   assert.ok(rows.some(e=>e.message?.stopReason==='aborted'));
   plan.splice(0,plan.length,['read',{path:session.session}],['read',{path:'diagnostics.json'}],
-    ['record_findings',{findings:'The curriculum elapsed allocation expired without a proposal; no actor ran.',useful:false,paths:['diagnostics.json']}]);
+    ['record_findings',{claims:[{text:'The curriculum elapsed allocation expired without a proposal; no actor ran.',kind:'observation',proofs:[{reference:'file:diagnostics.json',quote:'curriculum-interrupted'}]}],useful:false,paths:['diagnostics.json']}]);
   const result=await findingsFor({...f.options,passed:false});
   const wire=JSON.parse(f.prompts.at(-1).split('Attempt diagnostics: ')[1].split('\n')[0]);
   assert.equal(wire.session,session.session);
@@ -84,12 +85,37 @@ test('valid proposal survives elapsed abort after native submission',{timeout:15
 });
 
 test('valid findings survive elapsed abort and retain final evidence hash',{timeout:15000},async t=>{
-  const f=await fixture(t,[['record_findings',{findings:'Observed diagnostic fact.',useful:false,paths:['evidence.log']}],'wait']);
+  const f=await fixture(t,[['record_findings',{claims:[{text:'Observed diagnostic fact.',kind:'observation',proofs:[{reference:'file:evidence.log',quote:'fact'}]}],useful:false,paths:['evidence.log']}],'wait']);
   await writeFile(join(f.path,'evidence.log'),'fact\n');
   const result=await summarize({...f.options,passed:false});
   assert.equal(result.evidence[0].sha256,createHash('sha256').update('fact\n').digest('hex'));
   assert.equal(f.events.find(e=>e.type==='curriculum-interrupted').data.accepted,true);
   assert.equal(f.events.find(e=>e.type==='curriculum-session').data.role,'summary');
+});
+
+test('native summary cannot clean up or overwrite controller files and can still inspect and submit evidence',{timeout:15000},async t=>{
+  const plan=[],f=await fixture(t,plan);
+  plan.push(
+    ['bash',{command:`cd '${f.root}' && ls -d attempt; rm -rf attempt; ls -d attempt`}],
+    ['write',{path:'job.json',content:'overwritten'}],
+    ['edit',{path:'job.json',oldText:'trusted',newText:'changed'}],
+    ['ls',{path:'.'}],['find',{pattern:'*.log',path:'.'}],
+    ['grep',{pattern:'fact',path:'evidence.log'}],['read',{path:'evidence.log'}],
+    ['record_findings',{claims:[{text:'Observed diagnostic fact.',kind:'observation',proofs:[{reference:'file:evidence.log',quote:'fact'}]}],useful:false,paths:['evidence.log']}],
+  );
+  f.options.config.curriculum_seconds=10;
+  await writeFile(join(f.path,'job.json'),'trusted controller manifest\n');
+  await writeFile(join(f.path,'evidence.log'),'fact\n');
+  const result=await summarize({...f.options,passed:false});
+  assert.equal(await readFile(join(f.path,'job.json'),'utf8'),'trusted controller manifest\n');
+  assert.equal(result.findings,'Observed diagnostic fact.');
+  assert.equal(result.evidence[0].sha256,createHash('sha256').update('fact\n').digest('hex'));
+  for(const available of f.tools){
+    for(const name of ['bash','write','edit'])assert.equal(available.includes(name),false);
+    for(const name of ['read','grep','find','ls','record_findings'])assert.equal(available.includes(name),true);
+  }
+  const session=f.events.find(e=>e.type==='curriculum-session').data.session;
+  assert.ok((await stat(session)).size>0);
 });
 
 test('external cancellation is distinct from elapsed exhaustion',{timeout:15000},async t=>{
@@ -127,7 +153,7 @@ for(const type of ['curriculum-session','curriculum-interrupted'])
   });
 
 test('summary diagnostics use bounded tails without reading complete history',{timeout:15000},async t=>{
-  const f=await fixture(t,[['record_findings',{findings:'Retained numeric observations.',useful:false,paths:['evidence.log']}],'wait']);
+  const f=await fixture(t,[['record_findings',{claims:[{text:'Retained numeric observations.',kind:'observation',proofs:[{reference:'file:evidence.log',quote:'numeric observation'}]}],useful:false,paths:['evidence.log']}],'wait']);
   const {state,job}=f.options;
   await writeFile(join(f.path,'evidence.log'),'numeric observation\n');
   for(let n=0;n<40;n++) {

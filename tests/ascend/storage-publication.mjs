@@ -1,3 +1,9 @@
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {resolve} from 'node:path';
+import {runFailures} from '../../cli/failures.mjs';
+import {ownerStopped} from '../../controller/lifecycle.mjs';
+import {setTimeout as delay} from 'node:timers/promises';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm, cp, rename } from 'node:fs/promises';
@@ -7,7 +13,7 @@ import { State } from '../../controller/state.mjs';
 import { CampaignStorage } from '../../controller/storage.mjs';
 import { KnowledgeHistory } from '../../controller/knowledge-history.mjs';
 import { stages } from '../../controller/workflow.mjs';
-import { initializeStorageKnowledge, publishStorageMemory, recordStorageSkill } from '../../controller/storage-knowledge.mjs';
+import { initializeStorageKnowledge, publishStorageMemory, refreshStorageMemoryProvenance, recordStorageSkill } from '../../controller/storage-knowledge.mjs';
 import { deliverLessons } from '../../cli/memory.mjs';
 import { run as edit } from '../../cli/skill-input.mjs';
 
@@ -312,4 +318,38 @@ test('split legacy bare objects restore the SQLite-mapped promoted baseline with
   const promoted=await recordStorageSkill(f.config,'next',{promote:true,baseVersion:'initial'});
   assert.equal((await f.history.readRevision(promoted.revision)).skills['debug.md'],'next guidance');
   assert.equal((await f.history.state('memory')).revision,next.revision);
+});
+
+test('provenance refresh replays retained exact attempts without changing active memory or Git history',async t=>{
+ const {config,state,history}=await fixture(t);await publishStorageMemory(config,{...lesson(1),outcome:'failed',attempt_id:'failed-source'},{invoke:async(_tool,args)=>({generation:args.revision})});
+ const before=state.db.prepare("SELECT * FROM storage_revisions WHERE name='memory'").get(),head=await history.ref('refs/heads/memory');let staged;
+ const result=await refreshStorageMemoryProvenance(config,{invoke:async(tool,args)=>{assert.equal(tool,'stage_memory_revision');staged=args;return {generation:args.revision,unknown_provenance:[]};}});
+ assert.equal(staged.revision,before.generation);assert.equal(staged.records[0].attempt_id,'failed-source');assert.equal(staged.records[0].kind,'negative');assert.equal(result.refreshed,true);assert.deepEqual(result.unknownProvenance,[]);
+ assert.deepEqual(state.db.prepare("SELECT * FROM storage_revisions WHERE name='memory'").get(),before);assert.equal(await history.ref('refs/heads/memory'),head);
+});
+
+test('public provenance maintenance starts a stopped native KDB and backfills its existing active generation',{timeout:20000},async t=>{
+ const {config,state}=await fixture(t);await publishStorageMemory(config,{...lesson(1),attempt_id:'failed-source',outcome:'failed'},{invoke:async(_tool,args)=>({generation:args.revision})});
+ const active=state.db.prepare("SELECT * FROM storage_revisions WHERE name='memory'").get();
+ const python=(await promisify(execFile)(process.env.PYTHON??'python3.12',['-c','import sys;print(sys.executable)'])).stdout.trim(),repo=resolve('.'),wrapper=join(config.root,'python-wrapper');
+ await writeFile(wrapper,`#!${python}
+import sys,runpy
+sys.path[:0]=[${JSON.stringify(repo)},${JSON.stringify(join(repo,'tests','ascend'))}]
+mode=sys.argv[1];code=sys.argv[2];sys.argv=[code]+sys.argv[3:]
+if mode=='-m':runpy.run_module(code,run_name='__main__')
+else:exec(compile(code,'<command>','exec'))
+`,{mode:0o700});
+ config.python=wrapper;config.embedding_factory='kdb_fixture:Embeddings';
+ const history=await new KnowledgeHistory(join(config.root,'knowledge.git')).init(),snapshot=await history.readRevision(active.revision);
+ await promisify(execFile)(wrapper,['-c',`import json,sys
+from pathlib import Path
+from ascend_tools.kdb import KDB
+from kdb_fixture import Embeddings
+k=KDB(Path(sys.argv[1]),Embeddings());records=json.loads(sys.argv[3]);[r.pop('attempt_id',None) for r in records];k.stage_memory_revision(sys.argv[2],records);k.activate_memory_revision(sys.argv[2]);k.close()`,join(config.root,'knowledge.sqlite'),active.generation,JSON.stringify(snapshot.memory)]);
+ let owner;t.after(async()=>{if(owner&&!await ownerStopped(owner)){process.kill(owner.pid,'SIGTERM');for(let i=0;i<100&&!await ownerStopped(owner);i++)await delay(20);assert.equal(await ownerStopped(owner),true);}});
+ const result=await runFailures(config,{action:'refresh-memory-provenance'});owner=JSON.parse(await readFile(join(config.root,'knowledge-service.json'),'utf8')).owner;
+ assert.equal(result.refreshed,true);assert.deepEqual(result.unknownProvenance,[]);assert.deepEqual(state.db.prepare("SELECT * FROM storage_revisions WHERE name='memory'").get(),active);
+ const checked=await promisify(execFile)(wrapper,['-c',`import sqlite3,json,sys
+c=sqlite3.connect(sys.argv[1]);print(json.dumps([c.execute('SELECT revision FROM active_generation').fetchone()[0],c.execute('SELECT attempt_id FROM memory_provenance').fetchone()[0]]))`,join(config.root,'knowledge.sqlite')]);
+ assert.deepEqual(JSON.parse(checked.stdout),[active.generation,'failed-source']);
 });

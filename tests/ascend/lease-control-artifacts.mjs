@@ -72,7 +72,7 @@ for(const product of ['a3','a5'])test(`${product} lease cleanup output remains c
   };
   const result=await runAttempt({state,attempt,project:state.project('p').spec,attemptPath,skillMap,
     knowledge:{search:async()=>({content:[],evidence:[]})},modelRuntime:runtime,model:runtime.getModel('control-fixture','scripted'),
-    environmentFactory:context=>createEnvironment({mode:'cpl',target:'fixture',runtime:'registered',instructionFile,
+    environmentFactory:context=>createEnvironment({asyncCleanup:false,mode:'cpl',target:'fixture',runtime:'registered',instructionFile,
       workspacePath:'/registry/workspace',remoteDirectory:'owned',pollMs:0,probeSeconds:10,health:{product}},
       {...context,leaseDirectory:leases,client})});
   assert.equal(result.accepted,false,'fixture stops after preflight without completing the project');
@@ -98,7 +98,7 @@ for(const product of ['a3','a5'])test(`${product} lease cleanup output remains c
   const replacement=await reserveDevice(root,0,leases);
   assert.ok(replacement,'cleanup freed the physical device');
   const before=await readFile(replacement.receipt,'utf8');
-  const late=await genericEnvironment({mode:'cpl',target:'fixture',runtime:'registered',instructionFile,
+  const late=await genericEnvironment({asyncCleanup:false,mode:'cpl',target:'fixture',runtime:'registered',instructionFile,
     workspacePath:'/registry/workspace',remoteDirectory:'owned'},
     {instancePath:proof.controlDirectory??join(resolve(replacement.receipt,'..'),'control'),client,event:async()=>{},exclude:async(_label,fn)=>fn()});
   assert.deepEqual(await readdir(resolve(replacement.receipt,'..')),['lease.json'],'late cleanup must not recreate control inside a new reservation');

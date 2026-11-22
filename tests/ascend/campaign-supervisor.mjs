@@ -544,3 +544,105 @@ test('memory checkpoint recovery does not inherit an expired foreground inactivi
   assert.equal(result.reason,'complete');assert.equal(result.memory.recovered,true);
   assert.deepEqual(f.calls.map(call=>call[0]),['resume','pause']);
 });
+
+function resumedMinimum({maximum=4,rss=10,processCount=1,state='attention-needed',failedSample=false,previousSource='frozen-source'}={}) {
+  const waiting={...fresh(),operation:'campaign',attempts:2,budget:{cycle:'retained-cycle',elapsed:123},
+    status:{controller:{state:'running'},wait:{reason:'memory-concurrency-minimum'},progress:{done:false}}};
+  const f=fixture(failedSample?[waiting]:[waiting,done()]);
+  f.config.concurrency=maximum;
+  f.config.local_memory={lowBytes:20,softBytes:24,checkpointBytes:28,hardBytes:32,pollMs:2,reduceMs:30,highMs:120,coolMs:6};
+  const prior={sourceRevision:previousSource,owner:{boot:'boot'},state,reason:'memory-at-minimum',
+    memory:{limit:1,blocked:true,recovered:true,action:'throttle',rssBytes:29,processCount:9,highSince:-1000,lastReduction:-1000}};
+  const controls=[];let sampled=0;
+  f.deps.load=async()=>structuredClone(prior);
+  f.deps.memorySample=async()=>{sampled++;if(failedSample)throw Error('Owned-process observation unavailable');
+    return {rssBytes:rss,processCount,largest:processCount?[{pid:42,role:'knowledge',rssBytes:rss}]:[]};};
+  f.deps.memoryControl=async(_config,value)=>controls.push(structuredClone(value));
+  f.deps.memoryPause=async()=>{};f.deps.memoryRelease=async()=>{};
+  return {...f,controls,sampled:()=>sampled,prior,waiting};
+}
+
+test('resumed minimum guard samples current owned memory and restores one foreground slot',async()=>{
+ for(const previousSource of ['frozen-source','previous-qualified-source']) {
+  const f=resumedMinimum({previousSource}),before=structuredClone(f.waiting.budget);
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'complete');assert.equal(f.sampled(),1);
+  const admitted=f.controls.find(control=>!control.blocked);
+  assert.equal(admitted.limit,2);assert.equal(admitted.rssBytes,10);
+  assert.equal(admitted.largest[0].role,'knowledge');
+  assert.equal(f.reports.find(report=>report.state==='running').elapsedSeconds,123);
+  assert.deepEqual(f.waiting.budget,before);assert.equal(f.config.concurrency,4);
+  assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+ }
+});
+
+test('resumed minimum guard does not bypass fresh high memory or a configured one-worker maximum',async()=>{
+  for(const input of [{rss:29},{maximum:1},{rss:0,processCount:0}]) {
+    const f=resumedMinimum(input),result=await superviseCampaign(options(),f.deps);
+    assert.equal(f.sampled(),1);assert.equal(result.reason,'memory-at-minimum');
+    assert.equal(result.memory.limit,1);assert.equal(result.memory.blocked,true);
+    assert.equal(result.memory.rssBytes,input.rss??10);
+    assert.ok(f.controls.every(control=>control.blocked));
+    assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+  }
+});
+
+test('resumed minimum guard keeps unknown measurements blocked instead of treating them as zero',async()=>{
+  const f=resumedMinimum({failedSample:true});let clock=0;
+  f.deps.now=()=>clock;f.deps.wait=async()=>{clock+=600000;};
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'infrastructure-or-ownership');assert.ok(f.sampled()>0);
+  assert.ok(f.controls.every(control=>control.blocked));
+  assert.equal(f.controls.some(control=>control.limit>1),false);
+  assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+});
+
+test('resumed minimum guard does not reset an ordinary running minimum-cap checkpoint',async()=>{
+  const f=resumedMinimum({state:'running'}),result=await superviseCampaign(options(),f.deps);
+  assert.equal(f.sampled(),1);assert.equal(result.reason,'memory-at-minimum');
+  assert.equal(result.memory.limit,1);assert.equal(result.memory.blocked,true);
+  assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+});
+
+test('resumed minimum guard tolerates old wait telemetry until acknowledgement, then guards a new wait',async()=>{
+  const f=resumedMinimum();let snapshots=0;
+  f.deps.snapshot=async()=>{
+    const value=structuredClone(f.waiting);
+    if(++snapshots===3)value.status.wait={reason:'actor-capacity'};
+    return value;
+  };
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(f.sampled(),4);assert.equal(result.reason,'memory-at-minimum');
+  assert.equal(f.reports.filter(report=>report.state==='running').length,3);
+  assert.ok(f.controls.some(control=>control.limit===2&&!control.blocked));
+  assert.equal(f.controls.at(-1).limit,1);assert.equal(f.controls.at(-1).blocked,true);
+});
+
+test('running low-memory recovery restores foreground admissions while keeping the A/B slot reserved',async()=>{
+ const {selectAdmission}=await import('../../controller/dispatch.mjs');
+ const running={...fresh(),operation:'campaign',attempts:2,budget:{cycle:'retained',elapsed:123},
+  status:{controller:{state:'running'},progress:{done:false}}};
+ const f=fixture([running]);f.config.concurrency=4;
+ f.config.local_memory={lowBytes:20,softBytes:24,checkpointBytes:28,hardBytes:32,pollMs:2,reduceMs:30,highMs:120,coolMs:6};
+ f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot:'boot'},state:'running',memory:{limit:2}});
+ const admissions=[];let limit=2;
+ f.deps.snapshot=async()=>({...running,status:{...running.status,progress:{done:limit===4}}});
+ f.deps.memorySample=async()=>({rssBytes:10,processCount:1});
+ f.deps.memoryControl=async(_config,memory)=>{
+  limit=memory.limit;const workers=[{kind:'background'}],jobs=[{kind:'original'}];let next;
+  while((next=selectAdmission(jobs,{running:workers,concurrency:limit})))workers.push(next);
+  admissions.push(workers.filter(w=>w.kind==='original').length);
+ };
+ assert.equal((await superviseCampaign(options(),f.deps)).reason,'complete');
+ assert.deepEqual([...new Set(admissions)],[1,2,3]);assert.equal(f.config.concurrency,4);
+ assert.equal(running.budget.elapsed,123);assert.deepEqual(f.calls.map(c=>c[0]),['pause']);
+});
+
+test('unknown owned-memory samples clear recovery timing and block admissions',async()=>{
+ const f=memoryFixture({prior:{limit:2,lowSince:-1000}});let clock=0;
+ f.deps.now=()=>clock;f.deps.wait=async()=>{clock+=600000;};
+ f.deps.memorySample=async()=>{throw Error('owned RSS unavailable');};
+ assert.equal((await superviseCampaign(options(),f.deps)).reason,'infrastructure-or-ownership');
+ assert.ok(f.controls.slice(1).every(c=>c.blocked&&c.lowSince===null&&c.limit===2));
+ assert.ok(f.controls.length>1);
+});

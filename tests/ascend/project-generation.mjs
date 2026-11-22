@@ -10,32 +10,37 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import {createHash} from 'node:crypto';
 import {curriculumRoleHistory} from '../../cli/curriculum.mjs';
 import {smokeBinding} from '../../examples/ascend-smoke/run.mjs';
 import {validateTargetBaseline} from '../../controller/baseline-preflight.mjs';
 import {freezeFiles} from '../../controller/evidence.mjs';
 import {State} from '../../controller/state.mjs';
-import {campaignProgress} from '../../controller/progress.mjs';
+import {campaignProgress,syncCampaignPlan,advanceCampaignEntry} from '../../controller/progress.mjs';
 import {RecoveryQueue,admitJob} from '../../controller/recovery.mjs';
 import {importProject} from '../../cli/instance.mjs';
 import {validateBundle} from '../../cli/project-bundle.mjs';
 import {createEnvironment} from '../../integrations/environments/index.mjs';
 import {target} from './resilience/fixtures.mjs';
-import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle} from '../../cli/project-generation.mjs';
+import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle,publishGeneratedProject} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false,rawConstruction=false,starterLayout,baselineDevice='cpu',brokenBaseline=false,omitBaselineConstruction=false}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,pauseDraft,importGate=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false,rawConstruction=false,starterLayout,baselineDevice='cpu',brokenBaseline=false,omitBaselineConstruction=false,repairFixturePaths=false,hiddenManifest=false}={}) {
   const root=await mkdtemp(join(process.env.DRIVER_ARTIFACTS??tmpdir(),'generation-'));
   t.after(()=>process.env.RSI_GENERATED_SMOKE_PROFILE?undefined:rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
   let verifierContent="import sys\nsys.path.insert(0, '.')\n"+(pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
     badVerifier?'pass\n':`${nestedBundle?"from helper import factor\nfrom pathlib import Path\nassert (Path(__file__).parent/'reference'/'metadata.json').read_text() == 'trusted'\nassert (Path(__file__).parent/'negative'/'metadata.json').read_text() == 'wrong'\nassert factor == 2\n":''}from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`);
   if(omitConstruction||unequalDepth)verifierContent=verifierContent.replace("parent/'reference'","parent/'controls'/'reference'/'deep'");
+  const importStarted=join(root,'import-started'),importRelease=join(root,'import-release');
+  if(importGate)verifierContent=`import pathlib,time\nif 'projects' in pathlib.Path.cwd().parts:\n    pathlib.Path(${JSON.stringify(importStarted)}).touch()\n    while not pathlib.Path(${JSON.stringify(importRelease)}).exists(): time.sleep(.01)\n`+verifierContent;
   const requests=[];
+  let draftStarts=0;
   let waiting;const waitStarted=new Promise(ok=>waiting=ok);
   const server=createServer(async(req,res)=>{
     let raw='';for await(const b of req)raw+=b;
     const body=JSON.parse(raw),n=body.messages.filter(m=>m.role==='tool').length;requests.push(body);
-    if(pause || (pauseAfterRejection&&n===5)){waiting();await new Promise(ok=>res.once('close',ok));return;}
+    if(n===0)draftStarts++;
+    if(pause || draftStarts===pauseDraft || (pauseAfterRejection&&n===5)){waiting();await new Promise(ok=>res.once('close',ok));return;}
     const plan=[
       ['write',{path:'source/answer.py',content:pytorch?'def run(x):\n    return x + x\n':'answer=42\n'}],
       ['write',{path:'reference/answer.py',content:pytorch?`def run(x):\n    return x * ${positive===42?2:3}\n`:`answer=${positive}\n`}],
@@ -85,8 +90,28 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
       }
       if(starterLayout==='mismatch')plan.at(-1)[1].source='source/src';
     }
+    if(hiddenManifest){
+      for(const call of plan)if(call[0]==='write')call[1].path='project/'+call[1].path;
+      const proposal=plan.at(-1)[1];
+      for(const key of ['source','reference'])proposal[key]='project/'+proposal[key];
+      proposal.negative_controls=proposal.negative_controls.map(path=>'project/'+path);
+      proposal.verifier.files=['project/verify.py'];proposal.verifier.command.entrypoint='project/verify.py';proposal.construction_command.entrypoint='project/verify.py';
+      plan.splice(plan.length-1,0,['write',{path:'project/skill-evaluation.json',content:JSON.stringify({schema:1,cases:[]})}]);
+      // Repair the optional artifact in the same native session after the real
+      // post-bundle validator rejects it. No second generation budget is issued.
+      const files={'kernel.py':'reference/answer.py'},negative={files:{'kernel.py':'negative/answer.py'}};
+      const manifest={target:'cpu',objective:'correctness',tasks:Array.from({length:5},(_,i)=>({id:'case-'+i,kind:'hypothesis-case',bucket:'correctness',prompt:'Return 42',checker:'verify.py',files,controls:{reference:{files},negatives:[negative]}}))};
+      plan.push(['write',{path:'project/skill-evaluation.json',content:JSON.stringify(manifest)}],['submit_project',proposal]);
+    }
     if(omitConstruction)delete plan.at(-1)[1].construction_command;
     if(duplicateControl)plan.at(-1)[1].negative_controls=['negative','negative'];
+    if(repairFixturePaths){
+      const accepted=structuredClone(plan[4]);
+      plan[4][1].source='source/answer.py';plan[4][1].reference='reference/answer.py';
+      plan[4][1].verifier.files.push('reference/answer.py');
+      const directories=structuredClone(plan[4]);directories[1].source='source';directories[1].reference='reference';
+      plan.push(directories,accepted);
+    }
     if(repair)plan.push(['write',{path:'negative/answer.py',content:'answer=-12345\n'}],plan[4]);
     if(afterAccepted)plan.push(['write',{path:'verify.py',content:'raise Exception("modified")\n'}],
       ['write',{path:'source/answer.py',content:'answer=999\n'}],plan[4]);
@@ -106,7 +131,7 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
     actor:{provider:'generation-fixture',model:'scripted',credential_env:key,base_url:`http://127.0.0.1:${server.address().port}/v1`,
       metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
   const options={config,state,path:join(root,'drafts'),bridge:{extension:()=>{}},concurrency:1};
-  return {options,state,config,requests,verifierContent,waitStarted,unpause:()=>{pause=false;pauseAfterRejection=false;},
+  return {options,state,config,requests,verifierContent,waitStarted,importStarted,importRelease,unpause:()=>{pause=false;pauseDraft=undefined;pauseAfterRejection=false;},
     setPerformance:(goal,command)=>{performanceGoal=goal;performanceCommand=command;separateCommand=true;}};
 }
 
@@ -115,6 +140,82 @@ function topicQuota(f,topics) {
     generation:{topics,requirements:{SIMT:{performance:true,capabilityEvidence:true,comparison:'non-simt-or-vector'}}}}];
   f.config.kernel_language='triton';
 }
+
+async function publicationConfig(f) {
+  Object.assign(f.config,{format:1,revision:0,projects:[]});
+  await writeFile(join(f.config.root,'instance.json'),JSON.stringify(f.config));
+}
+
+test('streamed imports retain spent allocation and stay published across a later pause and restart',async t=>{
+  const f=await fixture(t,{pauseDraft:2});await publicationConfig(f);
+  const abort=new AbortController(),published=[];
+  const onReady=async spec=>{
+    assert.equal(await publishGeneratedProject({...f.options,spec,signal:abort.signal}),true);
+    published.push(spec.id);
+  };
+  const run=refillProjects({...f.options,signal:abort.signal,onReady});
+  await f.waitStarted;
+  const first=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(published[0]).data);
+  assert.equal(first.status,'imported');assert.ok(first.elapsed>0);assert.ok(first.spec.bundle.seconds<first.seconds);
+  abort.abort(new Error('pause later construction'));await assert.rejects(run);
+  assert.deepEqual(JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(first.id).data),first);
+  const second=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id!=?').get(first.id).data);
+  assert.equal(second.status,'draft');assert.ok(second.elapsed>0);assert.equal(second.seconds,first.seconds);
+  f.unpause();
+  const resumed=await refillProjects({...f.options,onReady:spec=>publishGeneratedProject({...f.options,spec})});
+  assert.deepEqual(resumed.map(spec=>spec.id),[second.id]);
+  const retained=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(second.id).data);
+  assert.equal(retained.status,'imported');assert.equal(retained.seconds,second.seconds);assert.ok(retained.elapsed>=second.elapsed);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM projects').get().n,2);
+  assert.equal(await publishGeneratedProject({...f.options,spec:resumed[0]}),true);
+  assert.deepEqual(await refillProjects({...f.options,onReady:()=>assert.fail('duplicate publication')}),[]);
+  const config=JSON.parse(await readFile(join(f.config.root,'instance.json'),'utf8'));
+  assert.equal(config.projects.length,2);assert.equal(new Set(config.curriculum.phase1).size,3);
+});
+
+test('a later ready draft failing imported negative controls preserves the earlier published project',async t=>{
+  const f=await fixture(t);await publicationConfig(f);
+  let first;
+  await assert.rejects(refillProjects({...f.options,onReady:async spec=>{
+    if(!first){assert.equal(await publishGeneratedProject({...f.options,spec}),true);first=spec;return true;}
+    const file=join(spec.bundle.negative_controls[0],'answer.py');
+    await writeFile(file,'answer=42\n');
+    spec.verifier.hashes[file]=createHash('sha256').update(await readFile(file)).digest('hex');
+    return publishGeneratedProject({...f.options,spec});
+  }}),/Imported bundle CPU negative control failed/);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM projects').get().n,1);
+  assert.ok(f.state.project(first.id));
+  const draft=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id!=?').get(first.id).data);
+  assert.equal(draft.status,'invalid');assert.ok(draft.elapsed>0);assert.ok(draft.spec.bundle.seconds<draft.seconds);
+  assert.deepEqual(JSON.parse(await readFile(join(f.config.root,'instance.json'),'utf8')).projects.map(spec=>spec.id),[first.id]);
+});
+
+for(const advance of [false,true])test(`publication rechecks ${advance?'changed entry':'filled quota'} after full import`,async t=>{
+  const f=await fixture(t,{importGate:true});
+  f.config.campaign_plan=[{id:'batch',phase:'phase1',new_projects:1,generation:{enabled:true}},
+    {id:'next',phase:'phase1',new_projects:1}];
+  if(advance)f.config.curriculum.generation.by_phase={phase1:{enabled:false}};
+  else f.config.curriculum.generation.enabled=false;
+  await publicationConfig(f);syncCampaignPlan(f.state,f.config);
+  const [spec]=await refillProjects(f.options);
+  const publishing=publishGeneratedProject({...f.options,spec});
+  t.after(()=>writeFile(f.importRelease,'released').catch(error=>{if(error.code!=='ENOENT')throw error;}));
+  for(let n=0;;n++) {
+    try{await access(f.importStarted);break;}catch(error){if(n>=300)throw error;await delay(10);}
+  }
+  const competing={id:'competitor',goal:'already supplied',actor_seconds:60,campaign_entry:'batch'};
+  f.state.add(competing);const queue=new RecoveryQueue(f.state),job=queue.claim(competing.id,0);
+  if(advance) {
+    queue.recordOriginal(job.attempt.id,{passed:true,findings:'observed',evidence:[{collection:'memory',entry_id:'one'}]},0);
+    queue.acknowledgeLesson(queue.lessons()[0].id);f.state.event(job.attempt.id,'postprocess-completed',{});
+    assert.equal(advanceCampaignEntry(f.state,f.config),true);
+  }
+  await writeFile(f.importRelease,'released');
+  assert.equal(await publishing,false);assert.equal(f.state.project(spec.id),undefined);
+  assert.deepEqual(JSON.parse(await readFile(join(f.config.root,'instance.json'),'utf8')).projects,[]);
+  const retained=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data);
+  assert.equal(retained.status,'ready');assert.ok(retained.elapsed>0);assert.ok(retained.spec.bundle.seconds<retained.seconds);
+});
 
 test('PyTorch-only SIMT specification is admitted on CPU while target implementation remains deferred',async t=>{
   const f=await fixture(t,{pytorch:true,performanceGoal:{comparison:'non-SIMT baseline'},performanceCommand:'actor-target-benchmark'});
@@ -203,12 +304,12 @@ test('native Pi constructs projects; real Python controls gate staged specs with
   assert.deepEqual(await refillPhase1(f.options),[]);
   const imported=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
   assert.deepEqual(imported.map(d=>d.status),['imported','imported']);
-  assert.ok(imported.every(d=>Object.keys(d).length===2));
+  assert.ok(imported.every(d=>d.elapsed>0&&d.seconds===f.config.curriculum_seconds&&d.spec));
 });
 
 test('a verifier accepting negative controls never enters original ledger',async t=>{
   const f=await fixture(t,{badVerifier:true});
-  assert.deepEqual(await refillPhase1(f.options),[]);
+  assert.deepEqual(await refillPhase1({...f.options,onReady:()=>assert.fail('invalid construction published')}),[]);
   const drafts=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
   assert.equal(drafts.length,2);assert.ok(drafts.every(d=>d.status==='invalid'&&d.elapsed>0));
   assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM projects').get().n,0);
@@ -696,4 +797,36 @@ test('new generated performance proposals require a baseline CPU selftest before
   const f=await fixture(t,{omitBaselineConstruction:true,performanceGoal:'timing',performanceCommand:'--performance'});
   assert.deepEqual(await refillProjects(f.options),[]);
   assert.equal(f.state.db.prepare("SELECT COUNT(*) AS n FROM generation_events WHERE type='generation-construction-check'").get().n,0);
+});
+
+
+test('native curriculum corrects file-valued fixtures and fixture-owned verifier entries before admission',async t=>{
+ const f=await fixture(t,{repairFixturePaths:true});topicQuota(f,['arithmetic']);
+ const specs=await refillProjects(f.options);assert.equal(specs.length,1);
+ const events=generationEventState(f.state.db).queryEvents(specs[0].id,{limit:1000});
+ assert.equal(events.filter(e=>e.type==='generation-rejected').length,2);
+ assert.deepEqual(specs[0].generation.checks.filter(c=>c.kind!=='baseline').map(c=>c.exitCode),[0,1,0]);
+ assert.equal(specs[0].verifier.files.some(file=>file.startsWith(specs[0].source+'/')),false);
+ const imported=await importProject(f.config.root,specs[0]);f.state.add(imported);
+ assert.equal(f.state.project(imported.id).status,'queued');
+ assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,0);
+});
+
+
+test('expanded hidden manifest is rejected before readiness and repaired in the same native session',async t=>{
+ const f=await fixture(t,{hiddenManifest:true});
+ const [spec]=await refillProjects(f.options);
+ assert.ok(spec);
+ const draft=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data);
+ const rejected=f.state.db.prepare("SELECT data FROM generation_events WHERE type='generation-rejected' AND draft=?").all(spec.id);
+ assert.equal(rejected.length,1);
+ assert.match(JSON.parse(rejected[0].data).error,/exactly five cases/);
+ assert.equal(draft.status,'ready');assert.ok(draft.elapsed>0);
+ const sessions=f.state.db.prepare("SELECT data FROM generation_events WHERE type='curriculum-session' AND draft=?").all(spec.id);
+ assert.equal(new Set(sessions.map(row=>JSON.parse(row.data).session)).size,1);
+ const transcript=await readFile(JSON.parse(sessions[0].data).session,'utf8');
+ const toolResults=transcript.split('\n').filter(Boolean).map(JSON.parse).filter(row=>row.message?.role==='toolResult');
+ assert.ok(toolResults.some(row=>row.message.isError&&JSON.stringify(row.message.content).includes('exactly five cases')));
+ const imported=await importProject(join(f.config.root,'imported'),spec);
+ assert.equal(imported.id,spec.id);
 });
