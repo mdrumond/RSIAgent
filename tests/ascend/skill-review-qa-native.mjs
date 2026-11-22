@@ -400,6 +400,10 @@ test('ordinary audit exposes the frozen starter bytes and retains scoped project
 
 test('a native answer repairs all rejected evidence refs from one checker response',async t=>{
  const {root,input,proof,answer,review}=await artifactQaFixture(t);
+ const alternateText='Independent verification evidence',sha256=createHash('sha256').update(alternateText).digest('hex');
+ const additional=join(root,'independent.log');await writeFile(additional,alternateText);
+ input.groups[0].linkedDiagnostics[0].artifacts.push({path:additional,sha256});
+ const alternate={reference:'artifact:'+sha256,startLine:1,endLine:1};
  let corrections=0;
  const provider=await scriptedReview(t,root,body=>{
   const outputs=body.messages.filter(message=>message.role==='tool');
@@ -407,6 +411,7 @@ test('a native answer repairs all rejected evidence refs from one checker respon
   const schema=body.tools.find(tool=>tool.function.name==='submit_review').function.parameters.properties.result;
   if(!schema.properties.answers)return {name:'submit_review',args:{result:review(proof)}};
   const value=answer(proof);
+  value.claims.find(claim=>claim.path==='answers.mechanism.text').proofs=[alternate];
   for(const topic of ['action','mechanism'])value.answers[topic].refs=['input:proposal'];
   if(outputs.length){
    const message=String(outputs.at(-1).content),begin=message.indexOf('[{"path":');
@@ -425,5 +430,5 @@ test('a native answer repairs all rejected evidence refs from one checker respon
  });
  assert.equal(result.verdict,'approved',result.error?.message??result.reason);assert.equal(corrections,1);
  assert.deepEqual(result.rounds[0].answers.action.refs,[proof.reference]);
- assert.deepEqual(result.rounds[0].answers.mechanism.refs,[proof.reference]);
+ assert.deepEqual(result.rounds[0].answers.mechanism.refs,[alternate.reference]);
 });
