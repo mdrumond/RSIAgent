@@ -155,12 +155,12 @@ test('native Pi classification submits validated results and resumes without ano
  const credentials_file=join(f.root,'fixture.env');await writeFile(credentials_file,'REVIEW_FIXTURE=fixture-only\n');
  const profile={provider:'review-fixture',model:'scripted',credential_env:'REVIEW_FIXTURE',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
  const input={directory,config:{actor:profile},group,entries:[],seconds:20,validate:r=>validateClassification(r,group,[])};
- const result=await nativeClassify(input);assert.equal(result.value.cause,'unknown');assert.ok(result.stats.tokens.total>0);assert.equal(requests,3);
+ const result=await nativeClassify(input);assert.equal(result.value.cause,'unknown');assert.ok(result.stats.tokens.total>0);assert.equal(requests,2);
  const saved=await load(join(directory,'submission.json'));
  // Legacy accepted submissions may contain copied excerpts rather than selectors.
  for(const proof of saved.claims[0].proofs){delete proof.startLine;delete proof.endLine;}
  await writeFile(join(directory,'submission.json'),JSON.stringify(saved));
- const replay=await nativeClassify(input);assert.equal(replay.recovered,true);assert.equal(requests,3);
+ const replay=await nativeClassify(input);assert.equal(replay.recovered,true);assert.equal(requests,2);
 });
 
 test('learning backlog retains every question while only two CPU projects execute',async t=>{
@@ -256,7 +256,7 @@ test('native reads page beyond the preview before classifying a late distinct fa
   {name:'submit_review',args:{result:decision('actor')}}
  ][n]);
  const result=await nativeClassify({directory,config:{actor:provider.profile},group,entries:[],seconds:30,validate:r=>validateClassification(r,group,[])});
- assert.equal(result.value.cause,'actor');assert.equal(provider.requests(),4);
+ assert.equal(result.value.cause,'actor');assert.equal(provider.requests(),3);
  const full=(await readFile(join(directory,'evidence','late-group-occurrences.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));assert.equal(full.length,7);assert.equal(full.at(-1).reference,'failure:6');
 });
 
@@ -268,7 +268,7 @@ test('a resumed native review validates saved retrieval citations without queryi
  await assert.rejects(reviewSession(input),error=>error.reviewSession?.kind==='no-submit');const session=await load(join(directory,'native-session.json'));
  await writeFile(join(directory,'retrievals.jsonl'),JSON.stringify({entries:[{collection:'memory',chunk_id:'old-entry'}]})+'\n');phase=1;
  const resumed=await reviewSession(input);assert.deepEqual(resumed.value.memoryRefs,['memory:old-entry']);assert.equal(resumed.retrievals.length,1);
- assert.deepEqual(await load(join(directory,'native-session.json')),session);assert.equal(provider.requests(),3);
+ assert.deepEqual(await load(join(directory,'native-session.json')),session);assert.equal(provider.requests(),2);
 });
 
 
@@ -330,7 +330,7 @@ test('native Pi blocks an outside workspace grep before execution and accepts co
   {name:'submit_review',args:{result:{...invalid,coverage:'covered'}}}
  ][n]);
  const result=await nativeClassify({directory,config:{actor:provider.profile},group,entries,seconds:30,validate:r=>validateClassification(r,group,entries)});
- assert.equal(result.value.coverage,'covered');assert.equal(provider.requests(),5);assert.equal(outsideActions,0);
+ assert.equal(result.value.coverage,'covered');assert.equal(provider.requests(),4);assert.equal(outsideActions,0);
  const blocks=(await readFile(join(directory,'tool-policy.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));
  assert.equal(blocks.length,1);assert.equal(blocks[0].tool,'grep');assert.equal(blocks[0].blocked,true);assert.equal(blocks[0].path,outside);
 });
@@ -348,7 +348,7 @@ test('native classification batches validate all group IDs and correct missing o
   {name:'submit_review',args:{result:bracketClaims}}
  ][n]);
  const result=await nativeClassifyBatch({directory,config:{actor:provider.profile},groups,entries:[],seconds:30,validate:r=>validateClassificationBatch(r,groups,[])});
- assert.deepEqual(result.value.classifications.map(r=>r.groupId),groups.map(g=>g.id));assert.equal(provider.requests(),5);
+ assert.deepEqual(result.value.classifications.map(r=>r.groupId),groups.map(g=>g.id));assert.equal(provider.requests(),4);
 });
 
 test('native classification repairs coverage and references from actual copyable tool feedback',async t=>{
@@ -422,7 +422,7 @@ test('native classification accepts primary selectors and refuses copied proof m
   {name:'submit_review',args:{result:{...value,claims:[claim({reference:'event:one',startLine:1,endLine:1})]}}}
  ][n]);
  const result=await nativeClassify({directory,config:{actor:provider.profile},group,entries:[],seconds:30,validate:r=>validateClassification(r,group,[])});
- assert.equal(result.value.cause,'unknown');assert.equal(provider.requests(),5);
+ assert.equal(result.value.cause,'unknown');assert.equal(provider.requests(),4);
  const rejected=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));
  assert.equal(rejected.length,2);
  assert.equal(result.value.claims[0].proofs[0].quote,JSON.stringify(group.occurrences[0].data));
@@ -482,7 +482,7 @@ test('native writer corrects blocker scope before authoritative grounding admits
   {name:'read',args:{path:'input.json'}},{name:'submit_review',args:{result:proposal}},{name:'submit_review',args:{result:corrected}}
  ][n]);
  const result=await reviewSession({directory,config:{actor:provider.profile},prompt:{task:'Submit evidence-backed guidance',groups},evidenceGroups:groups,seconds:30,validate:r=>validateReviewProposal(r,groups,classifications)});
- assert.equal(result.value.changes[0].scope,'preflight');assert.equal(provider.requests(),4);
+ assert.equal(result.value.changes[0].scope,'preflight');assert.equal(provider.requests(),3);
  const actor=structuredClone(corrected);actor.changes[0].response='actor-change';actor.changes[0].scope='implementation';assert.equal(validateReviewProposal(actor,groups,{harness:{cause:'actor'}}).changes[0].response,'actor-change');
  const unknown=structuredClone(corrected),ref='unknown-'+Date.now();unknown.changes[0].evidenceRefs=[ref];assert.throws(()=>validateReviewProposal(unknown,groups,classifications),error=>error.message.includes(ref));
 });
@@ -594,7 +594,7 @@ test('native writer corrects evaluation bucket used as guidance scope before adm
  const corrected=structuredClone(proposal);corrected.changes[0].scope='implementation';
  const provider=await scriptedReview(t,f.root,(_body,n)=>[{name:'read',args:{path:'input.json'}},{name:'submit_review',args:{result:proposal}},{name:'submit_review',args:{result:corrected}}][n]);
  const result=await reviewSession({directory,config:{actor:provider.profile},prompt:{task:'Submit evidence-backed guidance',groups},evidenceGroups:groups,seconds:30,validate:r=>validateReviewProposal(r,groups,classifications)});
- assert.equal(provider.requests(),4);assert.equal(result.value.changes[0].scope,'implementation');assert.equal(proposal.changes[0].scope,'correctness');
+ assert.equal(provider.requests(),3);assert.equal(result.value.changes[0].scope,'implementation');assert.equal(proposal.changes[0].scope,'correctness');
  assert.equal((await load(join(directory,'submission.json'))).changes[0].scope,'implementation');
  const pending={...proposal,action:'learn',question:'Which reduction axes?',hypothesis:'Axis order matters',requiredEvidence:'Independent check',learningTarget:'cpu'};
  assert.equal(validateReviewProposal(pending,groups,classifications).action,'learn');assert.equal(pending.changes[0].scope,'correctness');
