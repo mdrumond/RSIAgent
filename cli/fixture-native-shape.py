@@ -12,6 +12,12 @@ def modules(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module)
     return names
+checker = ast.parse(v['checker'])
+for node in ast.walk(checker):
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        imports = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or '']
+        if any(name.split('.')[0] in {'subprocess', 'multiprocessing'} for name in imports):
+            sys.exit('checker: execute the submitted implementation in this Python process so its compile and launch are measured. Load sys.argv[1] via runpy.run_path or importlib, invoke its callable, and independently compare returned values.')
 approved=set()
 for source in witnesses:
     try: approved.update(modules(ast.parse(source)))

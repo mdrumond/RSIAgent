@@ -10,10 +10,13 @@ const text=p=>readFile(p,'utf8');
 const get=async p=>{try{return JSON.parse(await text(p));}catch(e){if(e.code!=='ENOENT')throw e;return null;}};
 const save=async(p,data)=>{const tmp=p+'.'+randomUUID();await writeFile(tmp,JSON.stringify(data,null,2));await rename(tmp,p);};
 const schema=names=>({type:'object',properties:Object.fromEntries(names.map(k=>[k,{type:'string'}])),required:names,additionalProperties:false});
-const designSchema=schema(['decision','reason','prompt','starter','good','bad','checker','diagnostic','mathFailure']);
+const designFields=['prompt','starter','good','bad','checker','diagnosticRef','checkId'];
+const choice=(decision,names)=>{const spec=schema(['decision','reason',...names]);spec.properties.decision={const:decision,type:'string'};return spec;};
+const designSchema={anyOf:[choice('test',designFields),choice('probe',['code']),choice('withhold',['missing','basis'])]};
 const shape=fileURLToPath(new URL('./fixture-native-shape.py',import.meta.url));
 const route=fileURLToPath(new URL('./fixture-native-route.py',import.meta.url));
 const pinnedDesigner=new URL('./skills/fixture-designer/SKILL.md',import.meta.url);
+function validReason(reason){return typeof reason==='string'&&reason.trim()&&!/^(placeholder|todo|n\/a|unknown)[.!]?$/i.test(reason.trim());}
 async function sdkSourceIdentity(root){
  const entries=[];
  async function visit(dir){
@@ -47,30 +50,53 @@ export function publicPacket(input){
  assert(typeof originalContract==='string'&&originalContract.trim(),'original project contract is required');
  assert.equal(originalContract,visible['public-task'],'original contract differs from archived public-task');
  if(input.publicTask!==undefined)assert.equal(input.publicTask,originalContract,'publicTask and originalContract disagree');
- return {...visible,operation,originalContract};
+ const diagnosticOptions=visible['observed-output'].split(/\r?\n/).flatMap((line,i)=>causeLines(line).length?[{id:'observed-output:L'+(i+1),text:line.trim()}]:[]);
+ return {...visible,operation,originalContract,diagnosticOptions};
 }
-export function validateDesign(d,packet){
- assert(d.decision==='test'||d.decision==='withhold','submit test or withhold');
- assert(d.reason?.trim(),'supply a reason');
- if(d.decision==='withhold')return d;
- for(const key of designSchema.required)assert(typeof d[key]==='string'&&d[key].trim(),'missing '+key);
- const cause=d.diagnostic.trim();
- assert(!/[\r\n]/.test(cause)&&diagnosticLine(cause)&&/[a-zA-Z]{2}/.test(cause)&&cause.split(/\W+/).filter(Boolean).length>=2&&causeLines(packet['observed-output']).some(line=>line.includes(cause)),'copy a concrete cause from an archived diagnostic line, including its distinguishing detail');
- const p=spawnSync('python3',[shape],{input:JSON.stringify([d,[packet['failing-source']]]),encoding:'utf8'});
+const roles=['starter','good','bad'];
+const sourceKey=v=>v.replaceAll('\r\n','\n').trim();
+const material=d=>JSON.stringify(designFields.map(k=>sourceKey(d[k])));
+function expectedCause(d,packet){
+ const ref=packet.diagnosticOptions.find(r=>r.id===d.diagnosticRef);
+ assert(ref,'select an observed diagnostic reference: '+packet.diagnosticOptions.map(r=>r.id+' '+r.text).join(' | '));
+ return ref.text;
+}
+export function validateDesign(d,packet,feedback){
+ assert(['test','probe','withhold'].includes(d.decision),'submit test, probe or withhold');
+ assert(validReason(d.reason),'give the concrete reason for your decision');
+ if(d.decision==='withhold'){
+  assert(d.missing?.trim()&&d.missing!==d.reason,'name the missing fact or capability');
+  const bases=['public-task','failing-source','observed-output',...packet.diagnosticOptions.map(r=>r.id),...(feedback?.measuredControls?roles:[]),...(feedback?.probe?['probe']:[])];
+  assert(bases.includes(d.basis),'choose an available evidence basis: '+bases.join(', '));return d;
+ }
+ if(d.decision==='probe'){assert(d.code?.trim(),'supply an executable development probe');assert(d.code!==feedback?.probe?.code,'the same probe already returned; use its measurement or change the experiment');return d;}
+ for(const key of designFields)assert(typeof d[key]==='string'&&d[key].trim(),'missing '+key);
+ const diagnostic=expectedCause(d,packet);
+ assert(/^[A-Za-z][A-Za-z0-9_-]*$/.test(d.checkId),'select one stable numerical check ID, for example output-values');
+ assert(new Set(roles.map(role=>sourceKey(d[role]))).size===roles.length,'starter, good and bad must differ; the same implementation cannot demonstrate the required contrasts');
+ if(feedback?.previousFixture)assert(material(d)!==material(feedback.previousFixture),'unchanged fixture; revise the affected artifact or withhold with the missing evidence');
+ const p=spawnSync('python3',[shape],{input:JSON.stringify([{...d,diagnostic:diagnostic.replace(/^.*?:\s*/, '')},[packet['failing-source']]]),encoding:'utf8'});
  if(p.error)throw p.error;if(p.status!==0)throw Error(p.stderr.trim());
  return d;
 }
 const verified=/^VERIFIED_NATIVE_ROUTE [1-9]\d* [1-9]\d*\s*$/m;
-export function checkControls(design,runs){
- return ['starter','good','bad'].flatMap(role=>{
-  const {exit,output}=runs[role];
-  const ok=role==='starter'?exit!==0&&causeLines(output).some(line=>line.includes(design.diagnostic.trim())):role==='good'?exit===0&&verified.test(output):exit!==0&&verified.test(output)&&output.split(/\r?\n/).includes('AssertionError: '+design.mathFailure);
-  return ok?[]:[{role,exit,output:output.slice(-3000)}];
- });
+export function assessControls(design,runs,packet){
+ const diagnostic=expectedCause(design,packet);
+ return Object.fromEntries(roles.map(role=>{
+  const {exit,output}=runs[role],routeVerified=verified.test(output),causes=causeLines(output);
+  const numerical=causes.findLast(l=>l.trim().startsWith('AssertionError: '+design.checkId+': ')&&l.trim().slice(('AssertionError: '+design.checkId+': ').length).trim());
+  const expected=role==='starter'?{exit:'nonzero',diagnostic}:role==='good'?{exit:0,routeVerified:true}:{exit:'nonzero',routeVerified:true,checkId:design.checkId};
+  const matched=role==='starter'?exit!==0&&causes.some(l=>l.trim()===diagnostic):role==='good'?exit===0&&routeVerified:exit!==0&&routeVerified&&Boolean(numerical);
+  return [role,{matched,expected,observed:{exit,routeVerified,diagnostics:causes.slice(-4),numerical:numerical?.trim()??null},output:output.slice(-3000)}];
+ }));
+}
+export function checkControls(design,runs,packet){
+ return Object.entries(assessControls(design,runs,packet)).filter(([,v])=>!v.matched).map(([role,v])=>({role,...v}));
 }
 export async function scoreControl({dir,role,design,probe,device,remainingSeconds,signal}){
  await mkdir(dir,{recursive:true});
- await Promise.all([['kernel.py',design[role]],['check.py',design.checker],['route.py',await text(route)],['probe.py',"import runpy,sys\nsys.argv=['route.py','check.py','kernel.py'];runpy.run_path('route.py',run_name='__main__')\n"]].map(([name,bytes])=>writeFile(join(dir,name),bytes)));
+ if(role==='probe')await writeFile(join(dir,'probe.py'),design.code);
+ else await Promise.all([['kernel.py',design[role]],['check.py',design.checker],['route.py',await text(route)],['probe.py',"import runpy,sys\nsys.argv=['route.py','check.py','kernel.py'];runpy.run_path('route.py',run_name='__main__')\n"]].map(([name,bytes])=>writeFile(join(dir,name),bytes)));
  const clock=AbortSignal.timeout(Math.max(1,Math.ceil(remainingSeconds*1000)));
  const stop=signal?AbortSignal.any([signal,clock]):clock;stop.throwIfAborted();
  const child=spawn('/bin/bash',[probe,dir,String(device)],{detached:true,stdio:['ignore','pipe','pipe']});
@@ -105,33 +131,53 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
  if(await get(outcome))return get(outcome);
  const finish=async result=>{await save(outcome,result);return result;};
  session??=(await import('./skill-review-native.mjs')).reviewSession;
- let feedback=null;
+ let feedback=null;const scored=new Map();
  for(let round=1;now()<deadline;round++){
   signal?.throwIfAborted();
   const path=join(dir,'round-'+round);await mkdir(path,{recursive:true});
-  const prior=await get(join(path,'feedback.json'));if(prior){feedback=prior;continue;}
+  const prior=await get(join(path,'feedback.json'));if(prior){
+   for(const role of roles){const key=prior.controlKeys?.[role];if(key)scored.set(key,join(path,role,'score.json'));}
+   feedback=prior;continue;
+  }
   const author=join(path,'fixture.json');let d=await get(author);
   if(!d){
    const {value}=await session({directory:join(path,'designer'),config,fixtureDesigner:arm!=='control',signal,seconds:(deadline-now())/1000,allowedPaths:[sdk],resultSchema:designSchema,
-    prompt:{task:'Design a bounded device fixture for the observed leaf operation. Use the parent contract for context. Submit test or withhold. Supply callable implementations and an independent checker accepting the implementation filename as argv[1]. Vary values, include boundaries and preserved output sentinels where relevant. Bad must launch and trigger AssertionError with mathFailure. The runner executes each control and returns observations.',operation:packet.operation,originalContract:packet.originalContract,records:packet,sdk,feedback},validate:v=>validateDesign(v,packet)});
-   d=validateDesign(value,packet);await save(author,d);
+    prompt:{task:'Design a bounded device fixture for the observed leaf operation. Use the parent contract for context. Submit test, probe (a small standalone Python question run in the bound runtime), or withhold with a specific missing fact and evidence basis. Supply callable implementations and an independent checker accepting the implementation filename as argv[1]. Vary values, include boundaries and preserved output sentinels where relevant. Select diagnosticRef from records.diagnosticOptions. Bad must launch in the same Python process and trigger AssertionError with the stable checkId followed by colon, space and actual numerical details. Keep the oracle in the checker. The runner executes each control and returns observations.',operation:packet.operation,originalContract:packet.originalContract,records:packet,sdk,feedback},validate:v=>validateDesign(v,packet,feedback)});
+   d=validateDesign(value,packet,feedback);await save(author,d);
   }
-  if(d.decision==='withhold')return finish({status:'withheld',round,reason:d.reason});
-  const runs={};
+  if(d.decision==='withhold'){
+   if(now()>=deadline)return finish({status:'elapsed',round});
+   const {value}=await session({directory:join(path,'withhold-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason','reference']),
+    prompt:{task:'Check whether the claimed missing evidence is already available in these public records or development measurements. Return withhold if the gap is genuine. Otherwise return revise identifying the existing evidence or a specific development probe.',operation:packet.operation,records:packet,proposedDisposition:d,measurements:feedback?.assessment,probe:feedback?.probe},
+    validate:v=>{assert(['withhold','revise'].includes(v.verdict)&&validReason(v.reason));assert(['public-task','failing-source','observed-output',...packet.diagnosticOptions.map(r=>r.id),...(feedback?.assessment?roles:[]),...(feedback?.probe?['probe']:[])].includes(v.reference),'cite an available record');return v;}});
+   if(value.verdict==='withhold')return finish({status:'withheld',round,reason:d.reason,missing:d.missing,basis:d.basis,review:value});
+   feedback={...feedback,previousDisposition:d,review:value};delete feedback.controlKeys;await save(join(path,'feedback.json'),feedback);continue;
+  }
+  if(d.decision==='probe'){
+   if(now()>=deadline)return finish({status:'elapsed',round});
+   const probeFile=join(path,'probe-result.json');
+   const result=await get(probeFile)??await score({dir:join(path,'probe'),role:'probe',design:d,probe,device,signal,remainingSeconds:(deadline-now())/1000});
+   await save(probeFile,result);feedback={...feedback,probe:{code:d.code,reason:d.reason,exit:result.exit,output:result.output.slice(-3000)}};
+   delete feedback.controlKeys;await save(join(path,'feedback.json'),feedback);continue;
+  }
+  const runs={},controlKeys={};
   for(const role of ['starter','good','bad']){
    const where=join(path,role),stored=join(where,'score.json');await mkdir(where,{recursive:true});
+   const key=hash(JSON.stringify([identity,role,d[role],d.checker]));controlKeys[role]=key;
    runs[role]=await get(stored);
+   if(!runs[role]&&scored.has(key)){runs[role]=await get(scored.get(key));assert(runs[role]);await save(stored,{...runs[role],reusedFrom:scored.get(key)});}
    if(!runs[role]){
     if(now()>=deadline)return finish({status:'elapsed',round});
     runs[role]=await score({dir:where,role,design:d,probe,device,signal,remainingSeconds:(deadline-now())/1000});await save(stored,runs[role]);
    }
   }
-  const failures=checkControls(d,runs);
-  feedback={previousFixture:d,measuredControls:Object.fromEntries(Object.entries(runs).map(([role,r])=>[role,{exit:r.exit,output:r.output.slice(-3000)}])),failures};
+  const failures=checkControls(d,runs,packet);
+  for(const role of roles)scored.set(controlKeys[role],join(path,role,'score.json'));
+  feedback={previousFixture:d,controlKeys,assessment:assessControls(d,runs,packet),measuredControls:Object.fromEntries(Object.entries(runs).map(([role,r])=>[role,{exit:r.exit,output:r.output.slice(-3000)}])),failures};
   if(!failures.length){
    if(now()>=deadline)return finish({status:'elapsed',round});
-   const {value}=await session({directory:join(path,'independent-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason']),
-    prompt:{task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Give a specific correction or withhold if unsupported.',operation:packet.operation,records:packet,fixture:d,measurements:runs},validate:v=>{assert(['approve','revise','withhold'].includes(v.verdict)&&v.reason?.trim());return v;}});
+   const {value}=await session({directory:join(path,'independent-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason','reference']),
+    prompt:{task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Cite the role (starter/good/bad), checker or archived diagnostic reference supporting your decision. Give a specific correction or withhold if unsupported.',operation:packet.operation,records:packet,fixture:d,measurements:feedback.assessment},validate:v=>{assert(['approve','revise','withhold'].includes(v.verdict)&&validReason(v.reason));assert([...roles,'checker',d.diagnosticRef].includes(v.reference),'cite a scored role, checker or selected diagnostic');return v;}});
    if(value.verdict!=='revise')return finish({status:value.verdict==='approve'?'qualified':'withheld',round,reason:value.reason});
    feedback.review=value;
   }

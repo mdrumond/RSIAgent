@@ -9,8 +9,8 @@ import {publicPacket,validateDesign,checkControls,runFixtureDesign,scoreControl}
 
 const code='import catlass.tla as tla\ndef run():\n return tla.compile(fn)()';
 const input={operation:'update each valid output lane',publicTask:'cover all lanes',records:[['public-task','cover all lanes'],['failing-source',code],['observed-output','error: duplicated index'],['inherited-guidance','historical guidance'],['private-evaluator','secret verifier']].map(([reference,text])=>({reference,text}))};
-const design={decision:'test',reason:'inspect the values beyond one tile',prompt:'cover lanes',starter:code,good:code,bad:code,checker:'check',diagnostic:'duplicated index',mathFailure:'tail mismatch'};
-const outputs={starter:{exit:1,output:'SyntaxError: duplicated index'},good:{exit:0,output:'VERIFIED_NATIVE_ROUTE 1 1'},bad:{exit:1,output:'VERIFIED_NATIVE_ROUTE 1 1\nAssertionError: tail mismatch'}};
+const design={decision:'test',reason:'inspect the values beyond one tile',prompt:'cover lanes',starter:code+' # starter',good:code,bad:code+' # mutant',checker:'check',diagnosticRef:'observed-output:L1',checkId:'output-values'};
+const outputs={starter:{exit:1,output:'error: duplicated index'},good:{exit:0,output:'VERIFIED_NATIVE_ROUTE 1 1'},bad:{exit:1,output:'VERIFIED_NATIVE_ROUTE 1 1\nAssertionError: output-values: 29 wrong lanes'}};
 
 test('missing operation or unbound original contract stops admission before model or scoring',async()=>{
  const run=input=>runFixtureDesign({config:{},input,arm:'control',dir:'/unreachable',seconds:1},{session:()=>assert.fail(),score:()=>assert.fail()});
@@ -21,9 +21,9 @@ test('missing operation or unbound original contract stops admission before mode
 });
 test('host-only proposed controls are rejected and failed wrong-control must exercise native route',()=>{
  const packet=publicPacket(input);assert.throws(()=>validateDesign({...design,good:'def run(x): return x+1'},packet),/native/);
- assert.throws(()=>validateDesign({...design,diagnostic:'SyntaxError'},{...packet,'observed-output':'SyntaxError: duplicated index'}),/concrete cause/);
- assert.equal(checkControls(design,{...outputs,starter:{exit:1,output:'Traceback\n    raise Exception("duplicated index")\nRuntimeError: missing module'}})[0].role,'starter');
- assert.deepEqual(checkControls(design,outputs),[]);assert.equal(checkControls(design,{...outputs,bad:{exit:1,output:'AssertionError: tail mismatch'}})[0].role,'bad');
+ assert.throws(()=>validateDesign({...design,diagnosticRef:'SyntaxError'},packet),/select an observed/);
+ assert.equal(checkControls(design,{...outputs,starter:{exit:1,output:'Traceback\n    raise Exception("duplicated index")\nRuntimeError: missing module'}},packet)[0].role,'starter');
+ assert.deepEqual(checkControls(design,outputs,packet),[]);assert.equal(checkControls(design,{...outputs,bad:{exit:1,output:'AssertionError: output-values: 29 wrong lanes'}},packet)[0].role,'bad');
 });
 test('paired public input stays identical; restore completed scores and apply reviewer feedback once',async t=>{
  const root=await mkdtemp(join(tmpdir(),'fixture-dev-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -35,14 +35,14 @@ test('paired public input stays identical; restore completed scores and apply re
   const skill=join(root,arm+'-skill.md');await writeFile(skill,'skill bytes');
   const deps={modelIdentity:async()=>({model:'one'}),designerSkill:skill,score:async({role,dir})=>{if(role==='good'&&!interrupted){interrupted=true;throw Error('infrastructure');}launches.push(dir);return outputs[role];},
    session:async args=>{assert(!JSON.stringify(args.prompt).includes('secret verifier'));sessions.push(args);assert.equal(args.prompt.operation,input.operation);assert.equal(args.prompt.records.originalContract,input.publicTask);
-    if(args.directory.endsWith('/designer'))return {value:args.validate(design)};
-    return {value:args.validate({verdict:sessions.length===2?'revise':'approve',reason:'protect tail values'})};}};
+    if(args.directory.endsWith('/designer'))return {value:args.validate(sessions.length===1?design:{...design,bad:design.bad+' changed'})};
+    return {value:args.validate({verdict:sessions.length===2?'revise':'approve',reason:'protect tail values',reference:'bad'})};}};
   await assert.rejects(runFixtureDesign(args,deps),/infrastructure/);
   assert.equal((await runFixtureDesign(args,deps)).status,'qualified');
   assert.equal((await runFixtureDesign(args,deps)).status,'qualified');
-  assert.equal(new Set(launches).size,6);assert.equal(launches.length,6);assert.equal(sessions.length,4);
+  assert.equal(new Set(launches).size,4);assert.equal(launches.length,4);assert.equal(sessions.length,4);
   assert.equal(sessions[0].fixtureDesigner,arm==='designer');assert.equal(sessions[1].fixtureDesigner,undefined);
-  assert.deepEqual(sessions[2].prompt.feedback.review,{verdict:'revise',reason:'protect tail values'});assert.deepEqual(sessions[2].prompt.feedback.previousFixture,design);assert.deepEqual(sessions[2].prompt.feedback.measuredControls.bad,outputs.bad);prompts[arm]=sessions[0].prompt;
+  assert.deepEqual(sessions[2].prompt.feedback.review,{verdict:'revise',reason:'protect tail values',reference:'bad'});assert.deepEqual(sessions[2].prompt.feedback.previousFixture,design);assert.deepEqual(sessions[2].prompt.feedback.measuredControls.bad,outputs.bad);prompts[arm]=sessions[0].prompt;
   await assert.rejects(runFixtureDesign({...args,device:1},deps),/inputs changed/);
   await assert.rejects(runFixtureDesign(args,{...deps,modelIdentity:async()=>({model:'two'})}),/inputs changed/);
   await writeFile(join(sdk,'core.py'),'x=2');await assert.rejects(runFixtureDesign(args,deps),/inputs changed/);await writeFile(join(sdk,'core.py'),'x=1');
@@ -69,4 +69,37 @@ test('cancellation closes a live native control and its subprocess before return
  let pid;for(let i=0;i<100&&!pid;i++){try{pid=Number(await readFile(pidFile,'utf8'));}catch{await new Promise(r=>setTimeout(r,10));}}
  assert(pid);abort.abort(Error('operator cancelled'));await assert.rejects(pending,/operator cancelled/);
  try{const stat=await readFile('/proc/'+pid+'/stat','utf8');assert.equal(stat.split(' ')[2],'Z');}catch(e){if(e.code!=='ENOENT')throw e;}
+});
+
+test('retained rejection patterns produce targeted feedback before device allocation',()=>{
+ const packet=publicPacket(input);
+ assert.throws(()=>validateDesign({...design,diagnosticRef:'The failure is '+packet['observed-output']},packet),/observed-output:L1/);
+ assert.throws(()=>validateDesign({...design,starter:design.good},packet),/must differ/);
+ assert.throws(()=>validateDesign({...design,reason:'new prose only'},packet,{previousFixture:design}),/unchanged fixture/);
+ assert.throws(()=>validateDesign({...design,checker:'import subprocess\nsubprocess.run(["python", "kernel.py"])'},packet),/in this Python process/);
+ assert.throws(()=>validateDesign({decision:'withhold',reason:'PLACEHOLDER',missing:'checker',basis:'public-task'},packet),/concrete reason/);
+ assert.throws(()=>validateDesign({decision:'withhold',reason:'need data',missing:'outputs',basis:'hidden-transfer'},packet),/available evidence/);
+ const changed={...outputs,bad:{...outputs.bad,output:outputs.bad.output.replace('29 wrong lanes','actual 31.5, expected 28.0')}};
+ assert.deepEqual(checkControls(design,changed,packet),[]);
+ const [failure]=checkControls(design,{...outputs,bad:{exit:1,output:'VERIFIED_NATIVE_ROUTE 1 1\nAssertionError: input-preserved: modified index 3'}},packet);
+ assert.deepEqual(failure.expected,{exit:'nonzero',routeVerified:true,checkId:'output-values'});assert.equal(failure.observed.numerical,null);assert.equal(failure.observed.routeVerified,true);
+});
+
+test('withhold dispute can obtain an actual probe observation and reach an independently grounded disposition',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'fixture-disposition-'));t.after(()=>rm(root,{recursive:true,force:true}));
+ const sdk=join(root,'sdk');await (await import('node:fs/promises')).mkdir(sdk);await writeFile(join(sdk,'sdk.py'),'x=1');
+ const probe=join(root,'adapter.sh');await writeFile(probe,'cd "$1" && python3 probe.py');
+ const args={config:{},input,arm:'control',dir:join(root,'trial'),probe,device:0,sdk,runtime:'local',seconds:30};
+ const disposition={decision:'withhold',reason:'historical arguments are not observable',missing:'the argument binding',basis:'observed-output:L1'};
+ let turns=0,reviews=0;
+ const result=await runFixtureDesign(args,{modelIdentity:async()=>({model:'mock'}),session:async o=>{
+  assert(!JSON.stringify(o.prompt).includes('secret verifier'));
+  if(o.directory.endsWith('/withhold-review')){
+   reviews++;return {value:o.validate({verdict:reviews===1?'revise':'withhold',reference:reviews===1?'observed-output:L1':'probe',reason:reviews===1?'inspect the public argument count':'probe shows the binding is unavailable'})};
+  }
+  turns++;if(turns===2){assert.equal(o.prompt.feedback.review.verdict,'revise');return {value:o.validate({decision:'probe',reason:'measure argument count',code:"print('observed count=2')"})};}
+  if(turns===3){assert.match(o.prompt.feedback.probe.output,/observed count=2/);return {value:o.validate({...disposition,basis:'probe'})};}
+  return {value:o.validate(disposition)};
+ }});
+ assert.equal(result.status,'withheld');assert.equal(result.basis,'probe');assert.equal(result.review.reference,'probe');assert.equal(turns,3);assert.equal(reviews,2);
 });
