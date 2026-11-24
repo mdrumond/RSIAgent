@@ -141,6 +141,7 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
  const finish=async result=>{await save(outcome,result);return result;};
  session??=(await import('./skill-review-native.mjs')).reviewSession;
  let feedback=null;const scored=new Map();
+ try{
  for(let round=1;now()<deadline;round++){
   signal?.throwIfAborted();
   const path=join(dir,'round-'+round);await mkdir(path,{recursive:true});
@@ -191,6 +192,10 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
    feedback.review=value;
   }
   await save(join(path,'feedback.json'),feedback);
+ }
+ }catch(error){
+  signal?.throwIfAborted();
+  if(error.name!=='TimeoutError'||(now()<deadline&&error.reviewSession?.kind!=='elapsed'))throw error;
  }
  return finish({status:'elapsed'});
 }

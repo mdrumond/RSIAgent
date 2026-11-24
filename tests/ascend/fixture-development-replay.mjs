@@ -122,3 +122,14 @@ test('packaged row-sum handoffs obey real replay admission and independently mea
  const checked=spawnSync(process.execPath,[example,consumer],{encoding:'utf8'});
  assert.equal(checked.status,0,checked.stderr);
 });
+
+test('a live control exceeding the assignment deadline immediately settles elapsed',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'fixture-expiry-'));t.after(()=>rm(root,{recursive:true,force:true}));
+ const sdk=join(root,'sdk');await (await import('node:fs/promises')).mkdir(sdk);await writeFile(join(sdk,'x.py'),'x=1');
+ const probe=join(root,'run.sh');await writeFile(probe,'sleep 10');
+ const args={config:{},input,arm:'control',dir:join(root,'trial'),probe,device:0,sdk,runtime:'local',seconds:0.25};
+ const deps={modelIdentity:async()=>({model:'mock'}),session:async o=>({value:o.validate(design)})};
+ assert.equal((await runFixtureDesign(args,deps)).status,'elapsed');
+ assert.equal(JSON.parse(await readFile(join(args.dir,'outcome.json'))).status,'elapsed');
+ assert.equal((await runFixtureDesign(args,{...deps,session:()=>assert.fail('completed')})).status,'elapsed');
+});
