@@ -1,0 +1,133 @@
+{
+  "generation": 16,
+  "items": [
+    {
+      "mechanism": "reduce",
+      "scope": "A5 Catlass VectorSSA reduction operation and mask operands",
+      "sha256": "d619cc207932eea73e0c2d314315679af2a23671600f1a89d252a594c96006c7",
+      "admission": "durable-A5/memory-e73d17113bc7613dbd89694449d9b37bbfd8a2ccfd4331548c8c85329d7f4d2d",
+      "entry": "722bf4ebf8c24c73f1cbbe3ca55bf1ec6728a878f37c7bb9e52b99b91309a809",
+      "file": "reduce.md"
+    },
+    {
+      "mechanism": "mixed-scalar",
+      "scope": "A5 Catlass mixed floating-point and integer scalar expressions",
+      "sha256": "d63135ea98ec045d405d08592242c4ba2db47deaf1b5d52042494dad8a2287b8",
+      "admission": "durable-A5/memory-a86ebac7502d49cc9e4faf6f2f2c57789dd4bca78d002910783697d1f574ba50",
+      "entry": "1e9613ba5af33378b8042eeea23a9a025aa15d285a0de2966dbef76ab3040a55",
+      "file": "mixed-scalar.md"
+    },
+    {
+      "mechanism": "literal-scalar",
+      "scope": "A5 Catlass literal construction in sparse argmax",
+      "sha256": "365bebaedfb0f9ae07f6e2f46d06fc4f9371f01aa5d271af119fa482d02a8ba8",
+      "admission": "durable-A5/memory-11ed2d5f0d49bad8c8a4791e41e9602b58d8034ac0b73635c543cbb8e0f014af",
+      "entry": "e16ed5a607d76f8c4d03a2bcc86cb3f333de5b8b54f58fcde04fb774c2fa23e1",
+      "file": "literal-scalar.md"
+    },
+    {
+      "mechanism": "simt-scatter",
+      "scope": "A5 Catlass SIMT scatter per-lane output coverage under chunking",
+      "sha256": "1df0fc401d50ed774c0b73da6c034f87b5eec73a3304cc1217af7e5e304ad76e",
+      "admission": "isolated-A5-scoped/lesson-fcab54274204876da12989079b6dc6e041564f688cd6d77d5c8654e69a5ef3a1",
+      "entry": "e137b096dee1b2b930b13d004ed5aba972789553478b4bc61df17eaa4b15d451",
+      "file": "simt-scatter.md"
+    },
+    {
+      "mechanism": "gemm-stream",
+      "scope": "A5 custom GEMM launch after stream or shape changes",
+      "sha256": "17c743e68b29b8949e4bcccfaff1b9189babb7942d33fe54d587ff23edfea90b",
+      "admission": "durable-A5/memory-ac8ae6109d206139d5d481ad944a0255d91b063a93df8d0d285b985e82130d8f",
+      "entry": "5dbc1e7c176619dafa653e38c76234e6ef3d793ec9bbf4821e65c36a936cfe42",
+      "file": "gemm-stream.md"
+    },
+    {
+      "mechanism": "simd-register",
+      "scope": "A5 SIMD register overflow on float32 tile loads and stores. Floor-division loops need a separate tail for partial registers.",
+      "sha256": "fa7db6c5059a828f2d14ad7b6c2b97293a5f13e765d2ade89c94f259410ba3ce",
+      "admission": "durable-A5/memory-cff521db9af5b4e7a8512d4e497900e140c969ae2fe5656dac804a480e77499b",
+      "entry": "aa6ca9ea97b00f0587bd21875c594d42f8b39fb965a64ab072a745b1685e4d99",
+      "file": "simd-register.md"
+    },
+    {
+      "mechanism": "dlpack-rank",
+      "scope": "A5 Catlass explicit RowMajor import of contiguous higher-rank inputs",
+      "sha256": "be0af87cecaa94f8034fe435c5b93a5af3418a4a24ea13b832ea6ce0440f3731",
+      "admission": "durable-A5/memory-b7a1a21987452d51538c9df33e1c220f3f75b73b7aab23b36f7916a7833f88fc",
+      "entry": "8dc155cdf95b22dbf355165846845f51af351731b9018ba94a38c90c8596f4a6",
+      "file": "dlpack-rank.md"
+    },
+    {
+      "mechanism": "explicit-vector-region",
+      "scope": "A5 Catlass DSL implementation guidance",
+      "sha256": "9a372f3bb166052caffcfb05985b1b10d2cc53857052de227a0870b7fe032135",
+      "admission": "ad0955f036e0ac857a5ea86943b53baa70304d0c5e1191d8318f5a57c6ac9b2d",
+      "entry": "8ba5273c8ce8c1aea9a6f570a89a4af76b42ce0e8128f766dea5c303831a0d59",
+      "file": "explicit-vector-region.md"
+    },
+    {
+      "mechanism": "direct-kernel-call",
+      "scope": "A5 Catlass DSL implementation guidance",
+      "sha256": "5e54365580c8916a52b131be6cb32f1f03eb51138ceef245d4b488347c957cb4",
+      "admission": "12d687645c5ffc1dea7608c1ac85b36d92be02173e6037d6efa2648dd541fdb2",
+      "entry": "805c4f9871c173f9c7f7c872da33d960d0f7a9d7f0d5a657e1a9122bab00cc49",
+      "file": "direct-kernel-call.md"
+    },
+    {
+      "mechanism": "fake-coordinate",
+      "scope": "A5 host compile descriptor creation only",
+      "sha256": "156bbaee970f18743f6df4ccd8b2a71d7a3eb19384937b1953db276e48a09b0f",
+      "admission": "66eebc23fad1f21ea91ad54fbf93e6cbb73eab9af8862c170fcbd4e89040f9a7",
+      "entry": "4d36e830c5ce6ed2ee82df9814ce7844bbcc4b028c0d51c74a7c6e90654dc499",
+      "file": "fake-coordinate.md"
+    },
+    {
+      "mechanism": "dsl-local-import",
+      "scope": "A5 Catlass DSL implementation guidance",
+      "sha256": "692c3ec1ebfc80bf906955480c58a438d0b6a0ac0a43344e0d30eb15ff0e386c",
+      "admission": "c9e524a19c96cddfd9d3f757d23719c80689023acf22848018d8bbc65e3c376f",
+      "entry": "6ae026d338e5ccbae997e9ad220164d8823d43a8f952227132e9f91c2da58730",
+      "file": "dsl-local-import.md"
+    },
+    {
+      "mechanism": "gm-ub-movement",
+      "scope": "A5 Catlass DSL implementation guidance",
+      "sha256": "f3665145740cf5563edf435b5056d6600dc2e75b526401eda10bfc28ac92c716",
+      "admission": "ed04969609d806411445fc2b724ce20635fca828bc6fdc9d3782da3b2bb61ece",
+      "entry": "42b119e3cf2e0d8624b345aa10e21dec8f16945ab00c799475fd4ff587f7e834",
+      "file": "gm-ub-movement.md"
+    },
+    {
+      "mechanism": "family-422",
+      "scope": "family-422",
+      "sha256": "1855a2215d358ef5cb441eede2b25330d5551b27b7062ca6494d8cd947c098e8",
+      "entry": "2ac2aa5a6c32eb16c5ce489b10f7c61581517a2c7cc6d88f301652403394cac6",
+      "admission": "db7d32355b4127bee2c87fccb41651293d4d1ca101b2d317c7e5572d4f730b99",
+      "file": "family-422.md"
+    },
+    {
+      "mechanism": "family-608",
+      "scope": "family-608",
+      "sha256": "5669455faad6ed06c67fa3904f2b2dbded4d82ca0e16111e488b73bd15b0bfcb",
+      "entry": "8345e4abbffee385a791c7453e28b14721d641203c5ebe810651aa8082ab8db4",
+      "admission": "02999cc224dcabdb58d7a8d17620970fd31e14153f87286bd87cd31fdd0e9c33",
+      "file": "family-608.md"
+    },
+    {
+      "mechanism": "family-359",
+      "scope": "family-359",
+      "sha256": "e4ef3ff7d1e8853bf54ea0a8d4828d4de05da0f12e854954d0454c1709660ede",
+      "entry": "da60a5901b9af9dbd1e29738bcb0313ce0a3dbd3cd7963ba6d3ab23e307a7d20",
+      "admission": "0294319a6f75be40a68d12ed9f075e35ab692d3b1a54493f975af058c84ee85a",
+      "file": "family-359.md"
+    },
+    {
+      "mechanism": "family-820",
+      "scope": "family-820",
+      "sha256": "704efabf3bb064ee37f51a9cc0a6e9aae9670da078d827411b1e29c636203475",
+      "entry": "102d4fc6fee311066359e1abe12b354b1ba9caf523e2a20048fc233adb349815",
+      "admission": "336e233b512fc0a58cecd4c452c4af60dc1f17156f9b780349ed76ec1ad734b2",
+      "file": "family-820.md"
+    }
+  ]
+}
