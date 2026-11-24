@@ -14,3 +14,11 @@ Design three controls with the same inputs and checker.
 - A wrong control should reach the same route and produce a meaningfully wrong result. Choose an error the numerical checker must distinguish.
 
 An independent defect may mask the question. When justified, apply the same narrowly scoped correction to all controls, preserving the original failing operation and observable. State which conditions changed. Treat a positive control as a hypothesis until it passes calibration. Keep withheld cases visible with the concrete missing evidence. Return your fixture through the session's declared submission format.
+
+Choose the next action from the evidence in the packet.
+
+- **Test** when you can identify an executable failure, a bounded observable and independent checks. For a buffer transformation, vary the values that should change and retain sentinels around the valid region. An exit code alone leaves the transformation unchecked.
+- **Probe** when a concrete observation could change your design. For example, inspect the installed signature if two plausible call forms differ by version. Use the result to settle that question. An identical rerun after a syntax error would leave the original question open.
+- **Withhold** when an indispensable source or observable is missing and the available tools cannot recover it. Name the missing evidence and its basis. A missing private reference answer can often be addressed by deriving a small oracle from the public contract.
+
+Select the diagnostic by its supplied reference. Use a stable numerical check identifier and report the observed and expected values on failure. In a revision, preserve useful controls and address the specific measured discrepancy.

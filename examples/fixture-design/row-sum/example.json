@@ -1,0 +1,19 @@
+{
+  "operation": "Sum each row of a contiguous 3x7 float32 matrix on A5.",
+  "originalContract": "Fill and return the provided three-element output with the sum across all seven columns of each row. Preserve the input and storage outside the output view.",
+  "diagnostic": "reason: TlaLoweringError: tla.scalar_load index rank must match tensor logical rank (shape rank 2, index rank 1)",
+  "checkId": "output-values",
+  "testReason": "The original operation reaches the matrix scalar load. A device result has three input-dependent row sums. An omitted column changes each sum while preserving the interface.",
+  "probeReason": "Check the installed bridge signature before attributing a host binding failure to device execution.",
+  "withhold": {
+    "decision": "withhold",
+    "reason": "Only a launch wrapper was retained.",
+    "missing": "The exact executed kernel source or an equivalent source-bound failure.",
+    "basis": "observed-output:L1"
+  },
+  "review": {
+    "verdict": "approve",
+    "reason": "The recorded controls reproduced the failure, passed all row sums and guards, and exposed an omitted last column on the device.",
+    "reference": "good"
+  }
+}

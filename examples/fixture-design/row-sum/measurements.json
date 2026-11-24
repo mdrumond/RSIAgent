@@ -1,0 +1,14 @@
+{
+  "starter": {
+    "exit": 1,
+    "output": "reason: TlaLoweringError: tla.scalar_load index rank must match tensor logical rank (shape rank 2, index rank 1)"
+  },
+  "good": {
+    "exit": 0,
+    "output": "VERIFIED_NATIVE_ROUTE 3 3"
+  },
+  "bad": {
+    "exit": 1,
+    "output": "VERIFIED_NATIVE_ROUTE 1 1\nAssertionError: output-values: seed=0 expected=[-9.0, 7.0, 3.0] got=[-11.0, 10.0, -1.0]"
+  }
+}
