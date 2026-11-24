@@ -41,7 +41,13 @@ export function publicPacket(input){
   const matches=input.records.filter(r=>r.reference===name);
   assert(matches.length===1&&typeof matches[0].text==='string','expected one public '+name+' record');visible[name]=matches[0].text;
  }
- return visible;
+ const operation=input.operation;
+ assert(typeof operation==='string'&&operation.trim(),'bounded operation is required');
+ const originalContract=input.originalContract??input.publicTask;
+ assert(typeof originalContract==='string'&&originalContract.trim(),'original project contract is required');
+ assert.equal(originalContract,visible['public-task'],'original contract differs from archived public-task');
+ if(input.publicTask!==undefined)assert.equal(input.publicTask,originalContract,'publicTask and originalContract disagree');
+ return {...visible,operation,originalContract};
 }
 export function validateDesign(d,packet){
  assert(d.decision==='test'||d.decision==='withhold','submit test or withhold');
@@ -89,7 +95,7 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
  const profile=config.skill_writer_actor??config.actor;
  const model=await (modelIdentity??(await import('../controller/skill-context.mjs')).skillModelIdentity)(profile);
  const sdkHash=await sdkSourceIdentity(sdk);
- const identity=hash(JSON.stringify([arm,String(device),sdkHash,model,profile?.base_url,packet,input.operation,input.originalContract,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
+ const identity=hash(JSON.stringify([arm,String(device),sdkHash,model,profile?.base_url,packet,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
  await mkdir(dir,{recursive:true});
  const binding=join(dir,'binding.json'),previous=await get(binding);
  if(previous)assert.equal(previous.identity,identity,'replay inputs changed');
@@ -107,7 +113,7 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
   const author=join(path,'fixture.json');let d=await get(author);
   if(!d){
    const {value}=await session({directory:join(path,'designer'),config,fixtureDesigner:arm!=='control',signal,seconds:(deadline-now())/1000,allowedPaths:[sdk],resultSchema:designSchema,
-    prompt:{task:'Design a bounded device fixture for the observed leaf operation. Use the parent contract for context. Submit test or withhold. Supply callable implementations and an independent checker accepting the implementation filename as argv[1]. Vary values, include boundaries and preserved output sentinels where relevant. Bad must launch and trigger AssertionError with mathFailure. The runner executes each control and returns observations.',operation:input.operation,originalContract:input.originalContract,records:packet,sdk,feedback},validate:v=>validateDesign(v,packet)});
+    prompt:{task:'Design a bounded device fixture for the observed leaf operation. Use the parent contract for context. Submit test or withhold. Supply callable implementations and an independent checker accepting the implementation filename as argv[1]. Vary values, include boundaries and preserved output sentinels where relevant. Bad must launch and trigger AssertionError with mathFailure. The runner executes each control and returns observations.',operation:packet.operation,originalContract:packet.originalContract,records:packet,sdk,feedback},validate:v=>validateDesign(v,packet)});
    d=validateDesign(value,packet);await save(author,d);
   }
   if(d.decision==='withhold')return finish({status:'withheld',round,reason:d.reason});
@@ -125,7 +131,7 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
   if(!failures.length){
    if(now()>=deadline)return finish({status:'elapsed',round});
    const {value}=await session({directory:join(path,'independent-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason']),
-    prompt:{task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Give a specific correction or withhold if unsupported.',operation:input.operation,records:packet,fixture:d,measurements:runs},validate:v=>{assert(['approve','revise','withhold'].includes(v.verdict)&&v.reason?.trim());return v;}});
+    prompt:{task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Give a specific correction or withhold if unsupported.',operation:packet.operation,records:packet,fixture:d,measurements:runs},validate:v=>{assert(['approve','revise','withhold'].includes(v.verdict)&&v.reason?.trim());return v;}});
    if(value.verdict!=='revise')return finish({status:value.verdict==='approve'?'qualified':'withheld',round,reason:value.reason});
    feedback.review=value;
   }
@@ -137,6 +143,7 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
 export async function fixtureReplayRequest(config,request,signal){
  const {withSkillLock}=await import('./evolution-lock.mjs');
  const input=JSON.parse(await text(request.packet));
+ publicPacket(input);
  assert(config.target==='a5'&&/^\d+$/.test(String(request.device))&&request.sdk&&request.runtime);
  const dir=resolve(request.output);
  return withSkillLock(config,()=>runFixtureDesign({...request,input,dir,config,signal}),{signal,key:'fixture-replay:'+hash(dir)});
