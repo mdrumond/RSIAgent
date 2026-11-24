@@ -1,4 +1,5 @@
 """Require a live launch of an artifact compiled from or through the submitted module."""
+import json
 import runpy
 import sys
 from pathlib import Path
@@ -50,6 +51,13 @@ try:
     runpy.run_path(check, run_name="__main__")
 except BaseException as failure:
     if not (isinstance(failure, SystemExit) and failure.code in (None, 0)):
+        trace = failure.__traceback__
+        while trace and trace.tb_next:
+            trace = trace.tb_next
+        if isinstance(failure, AssertionError) and trace and Path(trace.tb_frame.f_code.co_filename).resolve() == Path(check).resolve():
+            check_id, separator, details = str(failure).partition(": ")
+            if separator and details.strip():
+                print("VERIFIED_CHECK_FAILURE", json.dumps({"id": check_id, "details": details}), flush=True)
         if all(counts):
             print("VERIFIED_NATIVE_ROUTE", *counts, flush=True)
         raise

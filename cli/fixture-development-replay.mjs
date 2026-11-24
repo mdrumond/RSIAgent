@@ -69,7 +69,7 @@ export function validateDesign(d,packet,feedback){
   const bases=['public-task','failing-source','observed-output',...packet.diagnosticOptions.map(r=>r.id),...(feedback?.measuredControls?roles:[]),...(feedback?.probe?['probe']:[])];
   assert(bases.includes(d.basis),'choose an available evidence basis: '+bases.join(', '));return d;
  }
- if(d.decision==='probe'){assert(d.code?.trim(),'supply an executable development probe');assert(d.code!==feedback?.probe?.code,'the same probe already returned; use its measurement or change the experiment');return d;}
+ if(d.decision==='probe'){assert(d.code?.trim(),'supply an executable development probe');const syntax=spawnSync('python3',['-c','import ast,sys; ast.parse(sys.stdin.read())'],{input:d.code,encoding:'utf8'});if(syntax.error)throw syntax.error;assert(syntax.status===0,syntax.stderr);assert(d.code!==feedback?.probe?.code,'the same probe already returned; use its measurement or change the experiment');return d;}
  for(const key of designFields)assert(typeof d[key]==='string'&&d[key].trim(),'missing '+key);
  const diagnostic=expectedCause(d,packet);
  assert(/^[A-Za-z][A-Za-z0-9_-]*$/.test(d.checkId),'select one stable numerical check ID, for example output-values');
@@ -84,10 +84,14 @@ export function assessControls(design,runs,packet){
  const diagnostic=expectedCause(design,packet);
  return Object.fromEntries(roles.map(role=>{
   const {exit,output}=runs[role],routeVerified=verified.test(output),causes=causeLines(output);
-  const numerical=causes.findLast(l=>l.trim().startsWith('AssertionError: '+design.checkId+': ')&&l.trim().slice(('AssertionError: '+design.checkId+': ').length).trim());
+  const report=output.split(/\r?\n/).findLast(l=>l.startsWith('VERIFIED_CHECK_FAILURE '));
+  let numerical=null;
+  if(report){
+   try{const hit=JSON.parse(report.slice('VERIFIED_CHECK_FAILURE '.length));if(hit.id===design.checkId&&typeof hit.details==='string'&&hit.details.trim())numerical=hit;}catch{/* Raw diagnostics remain available to the author. */}
+  }
   const expected=role==='starter'?{exit:'nonzero',diagnostic}:role==='good'?{exit:0,routeVerified:true}:{exit:'nonzero',routeVerified:true,checkId:design.checkId};
   const matched=role==='starter'?exit!==0&&causes.some(l=>l.trim()===diagnostic):role==='good'?exit===0&&routeVerified:exit!==0&&routeVerified&&Boolean(numerical);
-  return [role,{matched,expected,observed:{exit,routeVerified,diagnostics:causes.slice(-4),numerical:numerical?.trim()??null},output:output.slice(-3000)}];
+  return [role,{matched,expected,observed:{exit,routeVerified,diagnostics:causes.slice(-4),numerical},output:output.slice(-3000)}];
  }));
 }
 export function checkControls(design,runs,packet){
@@ -118,10 +122,11 @@ export async function scoreControl({dir,role,design,probe,device,remainingSecond
 export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,runtime,signal,seconds=3600},{session,score=scoreControl,now=Date.now,designerSkill=pinnedDesigner,modelIdentity}={}){
  assert(['control','skill','designer'].includes(arm)&&Number.isFinite(seconds)&&seconds>0);
  const packet=publicPacket(input);
+ const examples=await (await import('../examples/fixture-design/row-sum/packets.mjs')).rowSumHandoffs();
  const profile=config.skill_writer_actor??config.actor;
  const model=await (modelIdentity??(await import('../controller/skill-context.mjs')).skillModelIdentity)(profile);
  const sdkHash=await sdkSourceIdentity(sdk);
- const identity=hash(JSON.stringify([arm,String(device),sdkHash,model,profile?.base_url,packet,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
+ const identity=hash(JSON.stringify([arm,String(device),hash(JSON.stringify(examples)),sdkHash,model,profile?.base_url,packet,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
  await mkdir(dir,{recursive:true});
  const binding=join(dir,'binding.json'),previous=await get(binding);
  if(previous)assert.equal(previous.identity,identity,'replay inputs changed');
@@ -142,13 +147,13 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
   const author=join(path,'fixture.json');let d=await get(author);
   if(!d){
    const {value}=await session({directory:join(path,'designer'),config,fixtureDesigner:arm!=='control',signal,seconds:(deadline-now())/1000,allowedPaths:[sdk],resultSchema:designSchema,
-    prompt:{task:'Design a bounded device fixture for the observed leaf operation. Use the parent contract for context. Submit test, probe (a small standalone Python question run in the bound runtime), or withhold with a specific missing fact and evidence basis. Supply callable implementations and an independent checker accepting the implementation filename as argv[1]. Vary values, include boundaries and preserved output sentinels where relevant. Select diagnosticRef from records.diagnosticOptions. Bad must launch in the same Python process and trigger AssertionError with the stable checkId followed by colon, space and actual numerical details. Keep the oracle in the checker. The runner executes each control and returns observations.',operation:packet.operation,originalContract:packet.originalContract,records:packet,sdk,feedback},validate:v=>validateDesign(v,packet,feedback)});
+    prompt:{workedExample:feedback?examples.feedback:examples.designer,task:'Design a bounded device fixture for the observed leaf operation. Use the parent contract for context. Submit test, probe (a small standalone Python question run in the bound runtime), or withhold with a specific missing fact and evidence basis. Supply callable implementations and an independent checker accepting the implementation filename as argv[1]. Vary values, include boundaries and preserved output sentinels where relevant. Select diagnosticRef from records.diagnosticOptions. Bad must launch in the same Python process and trigger AssertionError with the stable checkId followed by colon, space and actual numerical details. Keep the oracle in the checker. The runner executes each control and returns observations.',operation:packet.operation,originalContract:packet.originalContract,records:packet,sdk,feedback},validate:v=>validateDesign(v,packet,feedback)});
    d=validateDesign(value,packet,feedback);await save(author,d);
   }
   if(d.decision==='withhold'){
    if(now()>=deadline)return finish({status:'elapsed',round});
    const {value}=await session({directory:join(path,'withhold-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason','reference']),
-    prompt:{task:'Check whether the claimed missing evidence is already available in these public records or development measurements. Return withhold if the gap is genuine. Otherwise return revise identifying the existing evidence or a specific development probe.',operation:packet.operation,records:packet,proposedDisposition:d,measurements:feedback?.assessment,probe:feedback?.probe},
+    prompt:{workedExample:examples.reviewer,task:'Check whether the claimed missing evidence is already available in these public records or development measurements. Return withhold if the gap is genuine. Otherwise return revise identifying the existing evidence or a specific development probe.',operation:packet.operation,records:packet,proposedDisposition:d,measurements:feedback?.assessment,probe:feedback?.probe},
     validate:v=>{assert(['withhold','revise'].includes(v.verdict)&&validReason(v.reason));assert(['public-task','failing-source','observed-output',...packet.diagnosticOptions.map(r=>r.id),...(feedback?.assessment?roles:[]),...(feedback?.probe?['probe']:[])].includes(v.reference),'cite an available record');return v;}});
    if(value.verdict==='withhold')return finish({status:'withheld',round,reason:d.reason,missing:d.missing,basis:d.basis,review:value});
    feedback={...feedback,previousDisposition:d,review:value};delete feedback.controlKeys;await save(join(path,'feedback.json'),feedback);continue;
@@ -177,7 +182,7 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
   if(!failures.length){
    if(now()>=deadline)return finish({status:'elapsed',round});
    const {value}=await session({directory:join(path,'independent-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason','reference']),
-    prompt:{task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Cite the role (starter/good/bad), checker or archived diagnostic reference supporting your decision. Give a specific correction or withhold if unsupported.',operation:packet.operation,records:packet,fixture:d,measurements:feedback.assessment},validate:v=>{assert(['approve','revise','withhold'].includes(v.verdict)&&validReason(v.reason));assert([...roles,'checker',d.diagnosticRef].includes(v.reference),'cite a scored role, checker or selected diagnostic');return v;}});
+    prompt:{workedExample:examples.reviewer,task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Cite the role (starter/good/bad), checker or archived diagnostic reference supporting your decision. Give a specific correction or withhold if unsupported.',operation:packet.operation,records:packet,fixture:d,measurements:feedback.assessment},validate:v=>{assert(['approve','revise','withhold'].includes(v.verdict)&&validReason(v.reason));assert([...roles,'checker',d.diagnosticRef].includes(v.reference),'cite a scored role, checker or selected diagnostic');return v;}});
    if(value.verdict!=='revise')return finish({status:value.verdict==='approve'?'qualified':'withheld',round,reason:value.reason});
    feedback.review=value;
   }

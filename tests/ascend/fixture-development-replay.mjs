@@ -10,7 +10,7 @@ import {publicPacket,validateDesign,checkControls,runFixtureDesign,scoreControl}
 const code='import catlass.tla as tla\ndef run():\n return tla.compile(fn)()';
 const input={operation:'update each valid output lane',publicTask:'cover all lanes',records:[['public-task','cover all lanes'],['failing-source',code],['observed-output','error: duplicated index'],['inherited-guidance','historical guidance'],['private-evaluator','secret verifier']].map(([reference,text])=>({reference,text}))};
 const design={decision:'test',reason:'inspect the values beyond one tile',prompt:'cover lanes',starter:code+' # starter',good:code,bad:code+' # mutant',checker:'check',diagnosticRef:'observed-output:L1',checkId:'output-values'};
-const outputs={starter:{exit:1,output:'error: duplicated index'},good:{exit:0,output:'VERIFIED_NATIVE_ROUTE 1 1'},bad:{exit:1,output:'VERIFIED_NATIVE_ROUTE 1 1\nAssertionError: output-values: 29 wrong lanes'}};
+const outputs={starter:{exit:1,output:'error: duplicated index'},good:{exit:0,output:'VERIFIED_NATIVE_ROUTE 1 1'},bad:{exit:1,output:'VERIFIED_NATIVE_ROUTE 1 1\nVERIFIED_CHECK_FAILURE {"id":"output-values","details":"29 wrong lanes"}\nAssertionError: output-values: 29 wrong lanes'}};
 
 test('missing operation or unbound original contract stops admission before model or scoring',async()=>{
  const run=input=>runFixtureDesign({config:{},input,arm:'control',dir:'/unreachable',seconds:1},{session:()=>assert.fail(),score:()=>assert.fail()});
@@ -34,7 +34,7 @@ test('paired public input stays identical; restore completed scores and apply re
   const args={config:{},input,arm,dir:join(root,arm),probe,device:0,sdk,runtime:'test',seconds:20};
   const skill=join(root,arm+'-skill.md');await writeFile(skill,'skill bytes');
   const deps={modelIdentity:async()=>({model:'one'}),designerSkill:skill,score:async({role,dir})=>{if(role==='good'&&!interrupted){interrupted=true;throw Error('infrastructure');}launches.push(dir);return outputs[role];},
-   session:async args=>{assert(!JSON.stringify(args.prompt).includes('secret verifier'));sessions.push(args);assert.equal(args.prompt.operation,input.operation);assert.equal(args.prompt.records.originalContract,input.publicTask);
+   session:async args=>{assert(!JSON.stringify(args.prompt).includes('secret verifier'));assert(args.prompt.workedExample?.accepted);sessions.push(args);assert.equal(args.prompt.operation,input.operation);assert.equal(args.prompt.records.originalContract,input.publicTask);
     if(args.directory.endsWith('/designer'))return {value:args.validate(sessions.length===1?design:{...design,bad:design.bad+' changed'})};
     return {value:args.validate({verdict:sessions.length===2?'revise':'approve',reason:'protect tail values',reference:'bad'})};}};
   await assert.rejects(runFixtureDesign(args,deps),/infrastructure/);
@@ -57,9 +57,9 @@ test('native route keeps oracle failure for incomplete second tile, rejects no l
  const route=fileURLToPath(new URL('../../cli/fixture-native-route.py',import.meta.url));
  const launch=async body=>{await writeFile(join(root,'checker.py'),body);return spawnSync('python3',[route,'checker.py','kernel.py'],{cwd:root,env:{...process.env,PYTHONPATH:root},encoding:'utf8'});};
  await writeFile(join(root,'kernel.py'),'def fill(a,n):\n for i in range(n): a[i]=1\n');
- const check=limit=>'import catlass.tla as tla,runpy\na=[0]*129\nfill=runpy.run_path("kernel.py")["fill"]\ntla.compile(fill)(a,'+limit+')\nassert a==[1]*129,"tail mismatch"';
+ const check=limit=>'import catlass.tla as tla,runpy\na=[0]*129\nfill=runpy.run_path("kernel.py")["fill"]\ntla.compile(fill)(a,'+limit+')\nassert a==[1]*129,"output-values: tail mismatch"';
  const good=await launch(check(129)),bad=await launch(check(128)),host=await launch('import catlass.tla as tla\nfrom kernel import fill\nfill([0],1)\ntla.compile(lambda: 1)()');
- assert.equal(good.status,0);assert.match(good.stdout,/VERIFIED_NATIVE_ROUTE 1 1/);assert.equal(bad.status,1);assert.match(bad.stderr,/tail mismatch/);assert.equal(host.status,1);assert.match(host.stderr,/no native Catlass launch/);
+ assert.equal(good.status,0);assert.match(good.stdout,/VERIFIED_NATIVE_ROUTE 1 1/);assert.equal(bad.status,1);assert.match(bad.stderr,/tail mismatch/);assert.match(bad.stdout,/VERIFIED_CHECK_FAILURE .*output-values/);assert.equal(host.status,1);assert.match(host.stderr,/no native Catlass launch/);
 });
 
 test('cancellation closes a live native control and its subprocess before returning',async t=>{
@@ -102,4 +102,16 @@ test('withhold dispute can obtain an actual probe observation and reach an indep
   return {value:o.validate(disposition)};
  }});
  assert.equal(result.status,'withheld');assert.equal(result.basis,'probe');assert.equal(result.review.reference,'probe');assert.equal(turns,3);assert.equal(reviews,2);
+});
+
+test('submitted exceptions cannot impersonate an oracle assertion',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'fixture-wrong-origin-'));t.after(()=>rm(root,{recursive:true,force:true}));
+ await (await import('node:fs/promises')).mkdir(join(root,'catlass'));await writeFile(join(root,'catlass','__init__.py'),'');
+ await writeFile(join(root,'catlass','tla.py'),'def compile(fn): return fn\n');
+ await writeFile(join(root,'kernel.py'),'import catlass.tla as tla\ndef run():\n tla.compile(lambda: 1)()\n raise AssertionError("output-values: fake result")');
+ await writeFile(join(root,'checker.py'),'import runpy\nrunpy.run_path("kernel.py")["run"]()');
+ const script=fileURLToPath(new URL('../../cli/fixture-native-route.py',import.meta.url));
+ const run=spawnSync('python3',[script,'checker.py','kernel.py'],{cwd:root,env:{...process.env,PYTHONPATH:root},encoding:'utf8'});
+ assert.equal(run.status,1);assert.match(run.stdout,/VERIFIED_NATIVE_ROUTE/);assert.doesNotMatch(run.stdout,/VERIFIED_CHECK_FAILURE/);
+ assert.equal(checkControls(design,{...outputs,bad:{exit:1,output:run.stdout+run.stderr}},publicPacket(input))[0].role,'bad');
 });
