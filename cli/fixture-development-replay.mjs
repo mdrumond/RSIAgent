@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {readFile,writeFile,mkdir,rename} from 'node:fs/promises';
+import {readFile,writeFile,mkdir,rename,readdir,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash,randomUUID} from 'node:crypto';
@@ -14,6 +14,25 @@ const designSchema=schema(['decision','reason','prompt','starter','good','bad','
 const shape=fileURLToPath(new URL('./fixture-native-shape.py',import.meta.url));
 const route=fileURLToPath(new URL('./fixture-native-route.py',import.meta.url));
 const pinnedDesigner=new URL('./skills/fixture-designer/SKILL.md',import.meta.url);
+async function sdkSourceIdentity(root){
+ const entries=[];
+ async function visit(dir){
+  const files=await readdir(dir,{withFileTypes:true});
+  for(const file of files.sort((a,b)=>a.name.localeCompare(b.name))){
+   const path=join(dir,file.name);
+   if(file.isDirectory()&&file.name!=='__pycache__')await visit(path);
+   else if(file.isFile()&&/\.pyi?$/.test(file.name))entries.push([path.slice(root.length+1),hash(await readFile(path))]);
+  }
+ }
+ await visit(root);assert(entries.length,'SDK contains no Python sources');
+ return hash(JSON.stringify([await realpath(root),entries]));
+}
+function diagnosticLine(line){
+ const value=line.trim();
+ return value&&!/^(Traceback|File ["']|During handling|The above exception|raise |assert )/.test(value)&&
+  !/^(?:[\w.]+(?:Error|Exception)|Error|Exception|error|reason|FAILED)[:\s]*$/i.test(value);
+}
+function causeLines(output){return output.split(/\r?\n/).filter(line=>diagnosticLine(line)&&/^\s*(?:[\w.]+(?:Error|Exception)|error|reason|fatal|AssertionError|failed)\s*:/i.test(line));}
 const fields=['public-task','failing-source','observed-output','inherited-guidance'];
 
 export function publicPacket(input){
@@ -29,7 +48,8 @@ export function validateDesign(d,packet){
  assert(d.reason?.trim(),'supply a reason');
  if(d.decision==='withhold')return d;
  for(const key of designSchema.required)assert(typeof d[key]==='string'&&d[key].trim(),'missing '+key);
- assert(!/[\r\n]/.test(d.diagnostic)&&packet['observed-output'].includes(d.diagnostic),'use a single diagnostic anchor copied from observed output');
+ const cause=d.diagnostic.trim();
+ assert(!/[\r\n]/.test(cause)&&diagnosticLine(cause)&&/[a-zA-Z]{2}/.test(cause)&&cause.split(/\W+/).filter(Boolean).length>=2&&causeLines(packet['observed-output']).some(line=>line.includes(cause)),'copy a concrete cause from an archived diagnostic line, including its distinguishing detail');
  const p=spawnSync('python3',[shape],{input:JSON.stringify([d,[packet['failing-source']]]),encoding:'utf8'});
  if(p.error)throw p.error;if(p.status!==0)throw Error(p.stderr.trim());
  return d;
@@ -38,7 +58,7 @@ const verified=/^VERIFIED_NATIVE_ROUTE [1-9]\d* [1-9]\d*\s*$/m;
 export function checkControls(design,runs){
  return ['starter','good','bad'].flatMap(role=>{
   const {exit,output}=runs[role];
-  const ok=role==='starter'?exit!==0&&output.includes(design.diagnostic):role==='good'?exit===0&&verified.test(output):exit!==0&&verified.test(output)&&output.split(/\r?\n/).includes('AssertionError: '+design.mathFailure);
+  const ok=role==='starter'?exit!==0&&causeLines(output).some(line=>line.includes(design.diagnostic.trim())):role==='good'?exit===0&&verified.test(output):exit!==0&&verified.test(output)&&output.split(/\r?\n/).includes('AssertionError: '+design.mathFailure);
   return ok?[]:[{role,exit,output:output.slice(-3000)}];
  });
 }
@@ -52,10 +72,13 @@ export async function scoreControl({dir,role,design,probe,device,remainingSecond
  return {exit:p.status,output};
 }
 
-export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,runtime,signal,seconds=3600},{session,score=scoreControl,now=Date.now,designerSkill=pinnedDesigner}={}){
+export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,runtime,signal,seconds=3600},{session,score=scoreControl,now=Date.now,designerSkill=pinnedDesigner,modelIdentity}={}){
  assert(['control','skill','designer'].includes(arm)&&Number.isFinite(seconds)&&seconds>0);
  const packet=publicPacket(input);
- const identity=hash(JSON.stringify([arm,packet,input.operation,input.originalContract,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
+ const profile=config.skill_writer_actor??config.actor;
+ const model=await (modelIdentity??(await import('../controller/skill-context.mjs')).skillModelIdentity)(profile);
+ const sdkHash=await sdkSourceIdentity(sdk);
+ const identity=hash(JSON.stringify([arm,sdkHash,model,profile?.base_url,packet,input.operation,input.originalContract,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
  await mkdir(dir,{recursive:true});
  const binding=join(dir,'binding.json'),previous=await get(binding);
  if(previous)assert.equal(previous.identity,identity,'replay inputs changed');
