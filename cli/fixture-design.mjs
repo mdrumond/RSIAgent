@@ -74,7 +74,7 @@ export function validateDesign(d,packet,feedback){
  assert(/^[A-Za-z][A-Za-z0-9_-]*$/.test(d.checkId),'select one stable numerical check ID, for example output-values');
  assert(new Set(roles.map(role=>sourceKey(d[role]))).size===roles.length,'starter, good and bad must differ; the same implementation cannot demonstrate the required contrasts');
  if(feedback?.previousFixture)assert(material(d)!==material(feedback.previousFixture),'unchanged fixture; revise the affected artifact or withhold with the missing evidence');
- const p=spawnSync('python3',[shape],{input:JSON.stringify([{...d,diagnostic:diagnostic.replace(/^.*?:\s*/, '')},[packet['failing-source']]]),encoding:'utf8'});
+ const p=spawnSync('python3',[shape],{input:JSON.stringify([{...d,archivedCause:diagnostic,diagnostic:diagnostic.replace(/^.*?:\s*/, '')},[packet['failing-source']]]),encoding:'utf8'});
  if(p.error)throw p.error;if(p.status!==0)throw Error(p.stderr.trim());
  return d;
 }

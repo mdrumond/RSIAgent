@@ -39,7 +39,16 @@ for source in witnesses:
     except SyntaxError: pass
 runtime={'torch','torch_npu','sys','importlib','pathlib','math','typing','numpy','os','functools','operator','itertools','collections','builtins','dataclasses'}
 for role in ('starter','good','bad'):
-    tree=ast.parse(v[role])
+    try:
+        tree = ast.parse(v[role])
+    except SyntaxError as exc:
+        expected = f"{type(exc).__name__}: {exc.msg}"
+        if role == 'starter' and v[role] in witnesses and v['archivedCause'] == expected:
+            # Its failure precedes import. Device qualification still executes the unchanged
+            # starter and requires witnessed launches from both numerical controls.
+            continue
+        sys.exit(f"{role}: {expected}. Only the exact archived starter may reproduce its recorded parse failure.")
+
     calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call)]
     names=modules(tree)
     for n in ast.walk(tree):

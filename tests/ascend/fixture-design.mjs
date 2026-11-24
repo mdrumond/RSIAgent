@@ -146,3 +146,15 @@ test('ordinary skill action refuses archived paired requests without touching th
  await assert.rejects(run({target:'a5'},{action:'fixture-design',arm:'skill',output:dir}),/original frozen runner/);
  assert.equal(await readFile(join(dir,'outcome.json'),'utf8'),prior);
 });
+
+test('only the unedited failing source may reproduce a recorded Python syntax failure',()=>{
+ const starter='import catlass.tla as tla\ndef run(:\n pass';
+ const pkt=publicPacket({...input,records:input.records.map(r=>r.reference==='failing-source'?{...r,text:starter}:r.reference==='observed-output'?{...r,text:'SyntaxError: invalid syntax'}:r)});
+ const submission={...design,starter};
+ assert.equal(validateDesign(submission,pkt),submission);
+ assert.throws(()=>validateDesign({...submission,starter:starter+'\n'},pkt),/only the exact archived starter/i);
+ assert.throws(()=>validateDesign({...submission,good:'def broken('},pkt),/good: SyntaxError/);
+ assert.throws(()=>validateDesign(submission,{...pkt,diagnosticOptions:[{id:submission.diagnosticRef,text:'SyntaxError: different cause'}]}),/only the exact archived starter/i);
+ const untraced={...outputs,starter:{exit:1,output:'SyntaxError: invalid syntax'},good:{exit:0,output:'host only'}};
+ assert.deepEqual(checkControls(submission,untraced,pkt).map(r=>r.role),['good']);
+});
