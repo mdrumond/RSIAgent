@@ -161,3 +161,18 @@ test('relocated snapshot performance logs supply facts without falling back to o
  await writeFile(original,text);await writeFile(copy,JSON.stringify({geomean_speedup:99}));const changed=await projectSummary({state:f.state,projectId:'p'});assert.equal(changed.measurements.length,0);assert.ok(changed.unknowns.some(x=>x.reason==='Performance artifact hash mismatch'));
  await rm(copy);const missing=await projectSummary({state:f.state,projectId:'p'});assert.equal(missing.measurements.length,0);assert.ok(missing.unknowns.some(x=>x.reason==='ENOENT'));
 });
+test('native fixture design activates only the pinned skill and separates cached sessions',async t=>{
+ const f=await fixture(t),directory=join(f.root,'design');
+ const seen=[];
+ const p=await provider(t,(_n,body)=>{
+  const active=body.messages.filter(m=>m.role==='user').flatMap(m=>typeof m.content==='string'?[m.content]:m.content.map(c=>c.text??'')).some(text=>text.includes('<skill name="fixture-designer"'));
+  seen.push(active);
+  return ['submit_review',{result:{active}}];
+ });
+ const input={directory,config:{root:f.root,actor:p.profile},prompt:{task:'Return activation'},seconds:15,validate:r=>r};
+ assert.deepEqual((await reviewSession(input)).value,{active:false});
+ assert.deepEqual((await reviewSession({...input,fixtureDesigner:true})).value,{active:true});
+ assert.deepEqual((await reviewSession({...input,fixtureDesigner:true})).value,{active:true});
+ assert.deepEqual((await reviewSession(input)).value,{active:false});
+ assert.deepEqual(seen,[false,true,false]);
+});

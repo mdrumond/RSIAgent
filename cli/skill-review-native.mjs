@@ -2,7 +2,7 @@
 import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat,rename} from 'node:fs/promises';
 import {join,resolve,dirname} from 'node:path';
 import {Type} from 'typebox';
-import {randomUUID} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {nativeAssertionAudit} from './skill-qa-assertions.mjs';
 import {proofSelectorCatalogue} from './claim-proofs.mjs';
 import {Check,Errors} from 'typebox/value';
@@ -27,6 +27,8 @@ import {validateSummaryTargets,qaFindingKinds} from './skill-review-qa.mjs';
 import {compactSummary,sourcePointers} from './skill-evidence-summary.mjs';
 import {diagnosticIdentity} from '../controller/skill-review.mjs';
 import {evaluateSkillObjective,evaluationSettings} from '../controller/skill-objectives.mjs';
+
+const designerSkillPath=fileURLToPath(new URL('./skills/fixture-designer/SKILL.md',import.meta.url));
 
 export const REVIEW_CONTRACT_VERSION=2;
 const nonempty=()=>Type.String({minLength:1});
@@ -85,13 +87,13 @@ export async function reviewWritePathAllowed(path,directory){
  if(!directory)return false;const root=await realpath(directory);let cursor=resolve(path);
  while(true){try{const actual=await realpath(cursor);return actual!==root&&actual.startsWith(root+'/')||actual===root&&cursor!==resolve(path);}catch(error){if(error.code!=='ENOENT')throw error;const parent=dirname(cursor);if(parent===cursor)return false;cursor=parent;}}
 }
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,previousResultSchema,proofRecords,requiredReads=[],compactEvidence=false,inlineProofSelectors=true,selectorOnly=false,discoveryProofRecords,writableDirectory,continueFamilyDraft=false,onModelTiming},{wrapStream,retrySettings}={}){
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,fixtureDesigner=false,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,previousResultSchema,proofRecords,requiredReads=[],compactEvidence=false,inlineProofSelectors=true,selectorOnly=false,discoveryProofRecords,writableDirectory,continueFamilyDraft=false,onModelTiming},{wrapStream,retrySettings}={}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
  await mkdir(agentDir,{recursive:true});
  // Use the pinned Pi path resolver so policy and native filesystem tools agree.
  const {resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href);
  if(writableDirectory){await mkdir(writableDirectory,{recursive:true});writableDirectory=await realpath(writableDirectory);}
- const declarations=[directory,...(writableDirectory?[writableDirectory]:[]),...evidenceGroups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].flatMap(o=>(o.artifacts??[]).map(a=>a.path))),...allowedPaths,...requiredReads];
+ const declarations=[directory,...(fixtureDesigner?[designerSkillPath]:[]),...(writableDirectory?[writableDirectory]:[]),...evidenceGroups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].flatMap(o=>(o.artifacts??[]).map(a=>a.path))),...allowedPaths,...requiredReads];
  const allowed=await Promise.all([...new Set(declarations)].map(async path=>{try{const canonical=await realpath(path);return {path:canonical,directory:(await stat(canonical)).isDirectory()};}catch(error){if(error.code!=='ENOENT')throw error;return {path:resolve(path),directory:false};}}));
  const evidence=await reviewEvidence(directory,evidenceGroups);
  if(prompt.group)prompt={...prompt,group:evidence.previews[0]};if(prompt.groups)prompt={...prompt,groups:evidence.previews};
@@ -126,7 +128,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   return validate(result,retrievals);
  };
  const contractFile=join(directory,'review-contract.json');
- const contract={version:REVIEW_CONTRACT_VERSION,schema,...(writableDirectory?{writableDirectory}:{})};
+ const contract={version:REVIEW_CONTRACT_VERSION,schema,...(fixtureDesigner?{fixtureDesignerSha256:createHash('sha256').update(await readFile(designerSkillPath)).digest('hex')}:{}),...(writableDirectory?{writableDirectory}:{})};
  let oldContract;try{oldContract=JSON.parse(await readFile(contractFile,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
  // A narrower submission schema can reuse the old transcript and cached
  // proof only through the current proof and admission checks.
@@ -176,8 +178,9 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const sessionFile=join(directory,'native-session.json');let retained;try{retained=compatible?JSON.parse(await readFile(sessionFile,'utf8')):undefined;}catch(e){if(e.code!=='ENOENT')throw e;}
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true,...retrySettings}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
  await writeFile(sessionFile,JSON.stringify({path:manager.getSessionFile()}));
- const loader=new sdk.DefaultResourceLoader({cwd:directory,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,
+ const loader=new sdk.DefaultResourceLoader({cwd:directory,agentDir,settingsManager,noExtensions:true,noSkills:true,additionalSkillPaths:fixtureDesigner?[designerSkillPath]:[],noContextFiles:true,
   extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
+ if(fixtureDesigner&&!loader.getSkills().skills.some(s=>s.name==='fixture-designer'&&s.filePath===designerSkillPath))throw Error('Pi could not load the configured fixture-designer skill');
  const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await skillModelFromProfile(config.skill_writer_actor??config.actor,{directory}),thinkingLevel:'off',
   tools:['read','grep','find','ls',...(writableDirectory?['write','edit']:[]),'submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
  // End at Pi's completed-turn boundary, including a submission batched with reads.
@@ -227,7 +230,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  let expired=false;const abort=()=>{void session.abort();},timer=setTimeout(()=>{expired=true;abort();},seconds*1000);signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();if(bridge)await bridge.knowledge.prepareSession(session,{signal});else await session.bindExtensions({});
-  await session.prompt((priorRejection?'Previous cached submission was rejected: '+priorRejection+'. Correct it within this session. ':'')+'Read input.json and follow its task. filesystemAccess.allowed lists the actual permitted files and directory trees, including any primary-source catalogue and its files outside this session directory; those declared paths may be read. Read diagnosticsFile, linkedDiagnosticsFile and fullOccurrences only when supplied; absent diagnostic files are not an instruction to search for them. Read explicitly required primary files before audit submission. Inspect relevant diagnostics using native read offset/limit when needed; diagnostic coverage is not a submission gate. Use only supplied evidence or enabled KDB tools, without searching implementation source or live workspaces. Submit the requested JSON result using submit_review, correcting its field-specific validation feedback rather than finishing with ordinary prose. Unknown is valid: never invent a cause, repair, source identity, device execution or measurement. Harness faults require user intervention, not actor repairs.');
+  await session.prompt((fixtureDesigner?'/skill:fixture-designer ':'')+(priorRejection?'Previous cached submission was rejected: '+priorRejection+'. Correct it within this session. ':'')+'Read input.json and follow its task. filesystemAccess.allowed lists the actual permitted files and directory trees, including any primary-source catalogue and its files outside this session directory; those declared paths may be read. Read diagnosticsFile, linkedDiagnosticsFile and fullOccurrences only when supplied; absent diagnostic files are not an instruction to search for them. Read explicitly required primary files before audit submission. Inspect relevant diagnostics using native read offset/limit when needed; diagnostic coverage is not a submission gate. Use only supplied evidence or enabled KDB tools, without searching implementation source or live workspaces. Submit the requested JSON result using submit_review, correcting its field-specific validation feedback rather than finishing with ordinary prose. Unknown is valid: never invent a cause, repair, source identity, device execution or measurement. Harness faults require user intervention, not actor repairs.');
   await session.waitForIdle();signal?.throwIfAborted();if(expired)throw new DOMException('Review session elapsed allocation exhausted','TimeoutError');
   if(continueFamilyDraft&&submitted===undefined){
    const responses=session.messages.slice(initialMessages).filter(m=>m.role==='assistant');
