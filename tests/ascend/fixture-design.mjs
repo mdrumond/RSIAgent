@@ -90,9 +90,14 @@ test('withhold dispute can obtain an actual probe observation and reach an indep
  const probe=join(root,'adapter.sh');await writeFile(probe,'cd "$1" && python3 probe.py');
  const args={config:{},input,dir:join(root,'trial'),probe,device:0,sdk,runtime:'local',seconds:30};
  const disposition={decision:'withhold',reason:'historical arguments are not observable',missing:'the argument binding',basis:'observed-output:L1'};
- let turns=0,reviews=0;
+ let turns=0,reviews=0;const timedOut=new Map();
  const result=await runFixtureDesign(args,{modelIdentity:async()=>({model:'mock'}),session:async o=>{
   assert(!JSON.stringify(o.prompt).includes('secret verifier'));
+  if(!timedOut.has(o.directory)&&o.directory.includes('round-1')){
+   timedOut.set(o.directory,o.seconds);
+   throw Object.assign(Error('model request timed out'),{reviewSession:{kind:'provider-error',retryableTimeout:true}});
+  }
+  if(timedOut.has(o.directory))assert(o.seconds<timedOut.get(o.directory)-0.8);
   if(o.directory.endsWith('/withhold-review')){
    assert.deepEqual(o.validate(o.prompt.workedExample.accepted),o.prompt.workedExample.accepted);assert.throws(()=>o.validate(o.prompt.workedExample.rejected));
    reviews++;return {value:o.validate({verdict:reviews===1?'revise':'withhold',reference:reviews===1?'observed-output:L1':'probe',reason:reviews===1?'inspect the public argument count':'probe shows the binding is unavailable'})};
@@ -101,7 +106,7 @@ test('withhold dispute can obtain an actual probe observation and reach an indep
   if(turns===3){assert.match(o.prompt.feedback.probe.output,/observed count=2/);return {value:o.validate({...disposition,basis:'probe'})};}
   return {value:o.validate(disposition)};
  }});
- assert.equal(result.status,'withheld');assert.equal(result.basis,'probe');assert.equal(result.review.reference,'probe');assert.equal(turns,3);assert.equal(reviews,2);
+ assert.equal(result.status,'withheld');assert.equal(result.basis,'probe');assert.equal(result.review.reference,'probe');assert.equal(turns,3);assert.equal(reviews,2);assert.equal(timedOut.size,2);
 });
 
 test('submitted exceptions cannot impersonate an oracle assertion',async t=>{

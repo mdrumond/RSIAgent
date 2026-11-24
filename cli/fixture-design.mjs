@@ -141,6 +141,7 @@ export async function runFixtureDesign(request,{session,score=scoreControl,now=D
  if(await get(outcome))return get(outcome);
  const finish=async result=>{await save(outcome,result);return result;};
  session??=(await import('./skill-review-native.mjs')).reviewSession;
+ const {scopedSession}=await import('./skill-scoped-review.mjs');
  let feedback=null;const scored=new Map();
  try{
  for(let round=1;now()<deadline;round++){
@@ -152,13 +153,13 @@ export async function runFixtureDesign(request,{session,score=scoreControl,now=D
   }
   const author=join(path,'fixture.json');let d=await get(author);
   if(!d){
-   const {value}=await session({directory:join(path,'designer'),config,signal,seconds:(deadline-now())/1000,allowedPaths:[sdk],resultSchema:designSchema,
+   const {value}=await scopedSession(session,{directory:join(path,'designer'),config,signal,seconds:(deadline-now())/1000,allowedPaths:[sdk],resultSchema:designSchema,
     prompt:{workedExample:feedback?examples.feedback:examples.designer,task:'Design a bounded device fixture for the observed leaf operation. Use the parent contract for context. Submit test, probe (a small standalone Python question run in the bound runtime), or withhold with a specific missing fact and evidence basis. Supply callable implementations and an independent checker accepting the implementation filename as argv[1]. Vary values, include boundaries and preserved output sentinels where relevant. Select diagnosticRef from records.diagnosticOptions. Bad must launch in the same Python process and trigger AssertionError with the stable checkId followed by colon, space and actual numerical details. Keep the oracle in the checker. The runner executes each control and returns observations.',operation:packet.operation,originalContract:packet.originalContract,records:packet,sdk,feedback},validate:v=>validateDesign(v,packet,feedback)});
    d=validateDesign(value,packet,feedback);await save(author,d);
   }
   if(d.decision==='withhold'){
    if(now()>=deadline)return finish({status:'elapsed',round});
-   const {value}=await session({directory:join(path,'withhold-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason','reference']),
+   const {value}=await scopedSession(session,{directory:join(path,'withhold-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason','reference']),
     prompt:{workedExample:{input:examples.designer.withhold,accepted:{verdict:'withhold',reference:'failing-source',reason:'The retained launch wrapper does not contain the executed kernel needed for this test.'},rejected:examples.reviewer.accepted,disposition:'Keep the specific missing evidence with the archived failure.',correction:'Use withhold or revise and cite a public record or an available measurement.'},task:'Check whether the claimed missing evidence is already available in these public records or development measurements. Return withhold if the gap is genuine. Otherwise return revise identifying the existing evidence or a specific development probe.',operation:packet.operation,records:packet,proposedDisposition:d,measurements:feedback?.assessment,probe:feedback?.probe},
     validate:v=>{assert(['withhold','revise'].includes(v.verdict)&&validReason(v.reason));assert(['public-task','failing-source','observed-output',...packet.diagnosticOptions.map(r=>r.id),...(feedback?.assessment?roles:[]),...(feedback?.probe?['probe']:[])].includes(v.reference),'cite an available record');return v;}});
    if(value.verdict==='withhold')return finish({status:'withheld',round,reason:d.reason,missing:d.missing,basis:d.basis,review:value});
@@ -187,7 +188,7 @@ export async function runFixtureDesign(request,{session,score=scoreControl,now=D
   feedback={previousFixture:d,controlKeys,assessment:assessControls(d,runs,packet),measuredControls:Object.fromEntries(Object.entries(runs).map(([role,r])=>[role,{exit:r.exit,output:r.output.slice(-3000)}])),failures};
   if(!failures.length){
    if(now()>=deadline)return finish({status:'elapsed',round});
-   const {value}=await session({directory:join(path,'independent-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason','reference']),
+   const {value}=await scopedSession(session,{directory:join(path,'independent-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason','reference']),
     prompt:{workedExample:examples.reviewer,task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Cite the role (starter/good/bad), checker or archived diagnostic reference supporting your decision. Give a specific correction or withhold if unsupported.',operation:packet.operation,records:packet,fixture:d,measurements:feedback.assessment},validate:v=>validateFixtureReview(v,d)});
    if(value.verdict!=='revise')return finish({status:value.verdict==='approve'?'qualified':'withheld',round,reason:value.reason});
    feedback.review=value;
