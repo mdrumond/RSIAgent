@@ -5,7 +5,7 @@ import {rowSumHandoffs, rowSumPackets} from './packets.mjs';
 
 const [consumer] = process.argv.slice(2);
 if (!consumer) throw Error('Usage: node validate.mjs PATH_TO_FIXTURE_REPLAY_MODULE');
-const {publicPacket, validateDesign, checkControls} = await import(pathToFileURL(resolve(consumer)));
+const {publicPacket, validateDesign, checkControls, validateFixtureReview} = await import(pathToFileURL(resolve(consumer)));
 const {input, test, probe, withhold} = await rowSumPackets();
 const packet = publicPacket(input);
 const examples = await rowSumHandoffs();
@@ -20,6 +20,8 @@ assert.throws(() => validateDesign(examples.designer.rejected, packet));
 assert.throws(() => validateDesign(examples.feedback.rejected, packet));
 validateDesign(examples.feedback.accepted, packet, examples.feedback.input);
 validateDesign(examples.designer.withhold.accepted, publicPacket(examples.designer.withhold.input));
+validateFixtureReview(examples.reviewer.accepted, test);
+assert.throws(() => validateFixtureReview(examples.reviewer.rejected, test));
 const measured = examples.reviewer.input.measurements;
 assert.deepEqual(checkControls(test, measured, packet), []);
 assert.deepEqual(checkControls(test, {...measured, bad: measured.starter}, packet).map(x => x.role), ['bad']);

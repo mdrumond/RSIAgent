@@ -40,7 +40,12 @@ export async function rowSumHandoffs() {
       correction: 'Select an artifact the reviewer actually received and explain how its measurements support the decision.'
     },
     feedback: {
-      input: {previousFixture: previous, feedback: 'The wrong control duplicates the working source.'},
+      input: {
+        previousFixture: previous,
+        assessment: {bad: {expected: {exit: 'nonzero', checkId: test.checkId},
+          observed: measurements.good}},
+        feedback: 'The wrong control duplicates the working source. Its measured output passes all checks.'
+      },
       accepted: test,
       disposition: 'Rerun calibration after changing the wrong control.',
       rejected: previous,
