@@ -194,7 +194,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   const inherited=origin?.previous.elapsed??0;
   const claimed=backlog.claim({base:config.skills.activeVersion,itemId:item.id,seconds:Math.min(origin?.previous.seconds??failureTiming.experimentSeconds,campaignLeft()+inherited),workflow:'failure-first-v1',owner});
   if(!claimed)return {status:'idle',reason:'Family already completed'};
-  run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now()-inherited*1000,directory:join(config.root,'skills','priority','failure-first',run.id),slots,...(!existing&&!origin&&config.target==='a5'&&config.skills.failureFirst.fixtureDesigner===true?{fixtureDesigner:true}:{}),experimentPolicy:origin?scopedPolicy:existing?'legacy':experimentPolicy(config.skills.failureFirst),...(origin?{writingReplay:origin.request,inheritedElapsedSeconds:inherited}:{})};
+  run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now()-inherited*1000,directory:join(config.root,'skills','priority','failure-first',run.id),slots,experimentPolicy:origin?scopedPolicy:existing?'legacy':experimentPolicy(config.skills.failureFirst),...(origin?{writingReplay:origin.request,inheritedElapsedSeconds:inherited}:{})};
   if(cp.workflow!=='failure-first-v1'||hash(cp.slots)!==hash(slots))throw Error('Retained experiment requires its exact original resource bindings');
   const resumedAt=now(),retainedElapsed=Math.max(run.elapsed,(resumedAt-cp.startedAt)/1000);
   const elapsed=()=>retainedElapsed+(now()-resumedAt)/1000;
@@ -245,7 +245,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
     const checked=await adapter.checkReferences({family,...(writing?{focused:true}:{}),directory:join(cp.directory,'submission-checks',randomUUID()),
      cacheScope:familyDirectory,seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
     if(writing){
-     const review=await ops.testReview({writing,family,directory:join(cp.directory,'test-reviews',family.identity),config:knowledgeConfig,
+     const review=await ops.testReview({writing,family,measurements:checked.diagnostics,directory:join(cp.directory,'test-reviews',family.identity),config:knowledgeConfig,
       seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
      if(review.verdict!=='approved')throw Object.assign(Error(review.field+' '+JSON.stringify(review.quote)+': '+review.defect),{code:'FAILURE_REFERENCE_REJECTED',diagnostics:checked.diagnostics});
      await writeFile(join(cp.directory,'test-approved.json'),JSON.stringify({family:family.identity,writing:writing.candidate.qa.approval,review}));
@@ -261,7 +261,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   };
   let prepared;
   try{
-   prepared=await ops.family({config,backlog,item:run.snapshot,directory:familyDirectory,...(cp.fixtureDesigner?{fixtureDesigner:true}:{}),...(writing?{approvedInstruction:writing.fields}:{}),...(origin?{priorIsolation:origin.isolation}:{}),seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
+   prepared=await ops.family({config,backlog,item:run.snapshot,directory:familyDirectory,...(writing?{approvedInstruction:writing.fields}:{}),...(origin?{priorIsolation:origin.isolation}:{}),seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
   }catch(error){
    if(writing&&referenceError?.reviewSession&&!signal?.aborted){
     if(runtime){closed=await runtime.close();runtime=null;if(!closed)throw Error('Test review execution remains unresolved');}

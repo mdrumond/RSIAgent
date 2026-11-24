@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {publicPacket,validateDesign,checkControls,runFixtureDesign,scoreControl} from '../../cli/fixture-development-replay.mjs';
+import {publicPacket,validateDesign,checkControls,runFixtureDesign,scoreControl} from '../../cli/fixture-design.mjs';
 
 const code='import catlass.tla as tla\ndef run():\n return tla.compile(fn)()';
 const input={operation:'update each valid output lane',publicTask:'cover all lanes',records:[['public-task','cover all lanes'],['failing-source',code],['observed-output','error: duplicated index'],['inherited-guidance','historical guidance'],['private-evaluator','secret verifier']].map(([reference,text])=>({reference,text}))};
@@ -13,7 +13,7 @@ const design={decision:'test',reason:'inspect the values beyond one tile',prompt
 const outputs={starter:{exit:1,output:'error: duplicated index'},good:{exit:0,output:'VERIFIED_NATIVE_ROUTE 1 1'},bad:{exit:1,output:'VERIFIED_NATIVE_ROUTE 1 1\nVERIFIED_CHECK_FAILURE {"id":"output-values","details":"29 wrong lanes"}\nAssertionError: output-values: 29 wrong lanes'}};
 
 test('missing operation or unbound original contract stops admission before model or scoring',async()=>{
- const run=input=>runFixtureDesign({config:{},input,arm:'control',dir:'/unreachable',seconds:1},{session:()=>assert.fail(),score:()=>assert.fail()});
+ const run=input=>runFixtureDesign({config:{},input,dir:'/unreachable',seconds:1},{session:()=>assert.fail(),score:()=>assert.fail()});
  for(const operation of [undefined,'','  '])await assert.rejects(run({...input,operation}),/bounded operation/);
  await assert.rejects(run({...input,publicTask:undefined}),/original project contract/);
  await assert.rejects(run({...input,originalContract:'incorrect contract'}),/differs/);
@@ -25,15 +25,13 @@ test('host-only proposed controls are rejected and failed wrong-control must exe
  assert.equal(checkControls(design,{...outputs,starter:{exit:1,output:'Traceback\n    raise Exception("duplicated index")\nRuntimeError: missing module'}},packet)[0].role,'starter');
  assert.deepEqual(checkControls(design,outputs,packet),[]);assert.equal(checkControls(design,{...outputs,bad:{exit:1,output:'AssertionError: output-values: 29 wrong lanes'}},packet)[0].role,'bad');
 });
-test('paired public input stays identical; restore completed scores and apply reviewer feedback once',async t=>{
+test('ordinary fixture design restores completed scores and applies reviewer feedback once',async t=>{
  const root=await mkdtemp(join(tmpdir(),'fixture-dev-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const sdk=join(root,'sdk');const {mkdir}=await import('node:fs/promises');await mkdir(sdk);await writeFile(join(sdk,'core.py'),'x=1');
- const probe=join(root,'run.sh');await writeFile(probe,'test');const prompts={};
- for(const arm of ['control','designer']){
+ const probe=join(root,'run.sh');await writeFile(probe,'test');
   const launches=[],sessions=[];let interrupted=false;
-  const args={config:{},input,arm,dir:join(root,arm),probe,device:0,sdk,runtime:'test',seconds:20};
-  const skill=join(root,arm+'-skill.md');await writeFile(skill,'skill bytes');
-  const deps={modelIdentity:async()=>({model:'one'}),designerSkill:skill,score:async({role,dir})=>{if(role==='good'&&!interrupted){interrupted=true;throw Error('infrastructure');}launches.push(dir);return outputs[role];},
+  const args={config:{},input,dir:join(root,'trial'),probe,device:0,sdk,runtime:'test',seconds:20};
+  const deps={modelIdentity:async()=>({model:'one'}),score:async({role,dir})=>{if(role==='good'&&!interrupted){interrupted=true;throw Error('infrastructure');}launches.push(dir);return outputs[role];},
    session:async args=>{assert(!JSON.stringify(args.prompt).includes('secret verifier'));assert(args.prompt.workedExample?.accepted);sessions.push(args);assert.equal(args.prompt.operation,input.operation);assert.equal(args.prompt.records.originalContract,input.publicTask);
     if(args.directory.endsWith('/designer'))return {value:args.validate(sessions.length===1?design:{...design,bad:design.bad+' changed'})};
     return {value:args.validate({verdict:sessions.length===2?'revise':'approve',reason:'protect tail values',reference:'bad'})};}};
@@ -41,14 +39,10 @@ test('paired public input stays identical; restore completed scores and apply re
   assert.equal((await runFixtureDesign(args,deps)).status,'qualified');
   assert.equal((await runFixtureDesign(args,deps)).status,'qualified');
   assert.equal(new Set(launches).size,4);assert.equal(launches.length,4);assert.equal(sessions.length,4);
-  assert.equal(sessions[0].fixtureDesigner,arm==='designer');assert.equal(sessions[1].fixtureDesigner,undefined);
-  assert.deepEqual(sessions[2].prompt.feedback.review,{verdict:'revise',reason:'protect tail values',reference:'bad'});assert.deepEqual(sessions[2].prompt.feedback.previousFixture,design);assert.deepEqual(sessions[2].prompt.feedback.measuredControls.bad,outputs.bad);prompts[arm]=sessions[0].prompt;
+  assert.deepEqual(sessions[2].prompt.feedback.review,{verdict:'revise',reason:'protect tail values',reference:'bad'});assert.deepEqual(sessions[2].prompt.feedback.previousFixture,design);assert.deepEqual(sessions[2].prompt.feedback.measuredControls.bad,outputs.bad);
   await assert.rejects(runFixtureDesign({...args,device:1},deps),/inputs changed/);
   await assert.rejects(runFixtureDesign(args,{...deps,modelIdentity:async()=>({model:'two'})}),/inputs changed/);
   await writeFile(join(sdk,'core.py'),'x=2');await assert.rejects(runFixtureDesign(args,deps),/inputs changed/);await writeFile(join(sdk,'core.py'),'x=1');
-  await writeFile(skill,'changed bytes');if(arm==='control')assert.equal((await runFixtureDesign(args,deps)).status,'qualified');else await assert.rejects(runFixtureDesign(args,deps),/inputs changed/);
- }
- assert.deepEqual(prompts.control,prompts.designer);
 });
 test('native route keeps oracle failure for incomplete second tile, rejects no launch',async t=>{
  const root=await mkdtemp(join(tmpdir(),'fixture-route-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -89,7 +83,7 @@ test('withhold dispute can obtain an actual probe observation and reach an indep
  const root=await mkdtemp(join(tmpdir(),'fixture-disposition-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const sdk=join(root,'sdk');await (await import('node:fs/promises')).mkdir(sdk);await writeFile(join(sdk,'sdk.py'),'x=1');
  const probe=join(root,'adapter.sh');await writeFile(probe,'cd "$1" && python3 probe.py');
- const args={config:{},input,arm:'control',dir:join(root,'trial'),probe,device:0,sdk,runtime:'local',seconds:30};
+ const args={config:{},input,dir:join(root,'trial'),probe,device:0,sdk,runtime:'local',seconds:30};
  const disposition={decision:'withhold',reason:'historical arguments are not observable',missing:'the argument binding',basis:'observed-output:L1'};
  let turns=0,reviews=0;
  const result=await runFixtureDesign(args,{modelIdentity:async()=>({model:'mock'}),session:async o=>{
@@ -118,7 +112,7 @@ test('submitted exceptions cannot impersonate an oracle assertion',async t=>{
 
 test('packaged row-sum handoffs obey real replay admission and independently measured calibration',()=>{
  const example=fileURLToPath(new URL('../../examples/fixture-design/row-sum/validate.mjs',import.meta.url));
- const consumer=fileURLToPath(new URL('../../cli/fixture-development-replay.mjs',import.meta.url));
+ const consumer=fileURLToPath(new URL('../../cli/fixture-design.mjs',import.meta.url));
  const checked=spawnSync(process.execPath,[example,consumer],{encoding:'utf8'});
  assert.equal(checked.status,0,checked.stderr);
 });
@@ -127,9 +121,17 @@ test('a live control exceeding the assignment deadline immediately settles elaps
  const root=await mkdtemp(join(tmpdir(),'fixture-expiry-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const sdk=join(root,'sdk');await (await import('node:fs/promises')).mkdir(sdk);await writeFile(join(sdk,'x.py'),'x=1');
  const probe=join(root,'run.sh');await writeFile(probe,'sleep 10');
- const args={config:{},input,arm:'control',dir:join(root,'trial'),probe,device:0,sdk,runtime:'local',seconds:0.25};
+ const args={config:{},input,dir:join(root,'trial'),probe,device:0,sdk,runtime:'local',seconds:0.25};
  const deps={modelIdentity:async()=>({model:'mock'}),session:async o=>({value:o.validate(design)})};
  assert.equal((await runFixtureDesign(args,deps)).status,'elapsed');
  assert.equal(JSON.parse(await readFile(join(args.dir,'outcome.json'))).status,'elapsed');
  assert.equal((await runFixtureDesign(args,{...deps,session:()=>assert.fail('completed')})).status,'elapsed');
+});
+
+test('ordinary skill action refuses archived paired requests without touching their outputs',async t=>{
+ const {run}=await import('../../cli/skill-input.mjs');
+ const dir=await mkdtemp(join(tmpdir(),'archived-pair-'));t.after(()=>rm(dir,{recursive:true,force:true}));
+ const prior='{"status":"qualified","round":2}';await writeFile(join(dir,'outcome.json'),prior);
+ await assert.rejects(run({target:'a5'},{action:'fixture-design',arm:'skill',output:dir}),/original frozen runner/);
+ assert.equal(await readFile(join(dir,'outcome.json'),'utf8'),prior);
 });

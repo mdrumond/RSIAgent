@@ -64,8 +64,8 @@ export async function reviewScopedArtifact({scope,fields,brief,directory,config,
  return {...validate(value),identity};
 }
 
-export async function reviewScopedTest({writing,family,directory,config,seconds,signal},review=reviewScopedArtifact){
- const fields={mechanism:JSON.stringify(family.mechanism)};
+export async function reviewScopedTest({writing,family,measurements,directory,config,seconds,signal},review=reviewScopedArtifact){
+ const fields={mechanism:JSON.stringify(family.mechanism),...(measurements?{measuredControls:JSON.stringify(measurements)}:{})};
  const allowedPaths=[];
  for(const task of [family.development,...family.transfer]){
   for(const [name,value] of Object.entries({prompt:task.prompt,caseIds:task.caseIds,controlCaseIds:task.controlCaseIds??task.caseIds,changeType:task.changeType,files:task.files,controls:task.controls,

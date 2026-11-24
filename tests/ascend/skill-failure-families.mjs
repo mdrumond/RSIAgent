@@ -345,11 +345,11 @@ test('A5 family isolation freezes A5 tasks and refuses an A3 manifest or schema 
  const f=await fixture(t);f.config.target='a5';f.family.target='a5';const file=await f.write(),loaded=await loadFailureFamily({file,config:f.config,item:f.item});assert.deepEqual([loaded.development,...loaded.transfer].map(task=>task.target),['a5','a5','a5']);
  await assert.rejects(loadFailureFamily({file,config:{...f.config,target:'a3'},item:f.item}),/matching A3.A5/);
  addCalibration(f);
- const directory=join(f.root,'a5-isolation'),result=await prepareFailureFamily({...f,directory,seconds:30,fixtureDesigner:true},{session:async({validate,writableDirectory,prompt,resultSchema,fixtureDesigner})=>{
-  assert.equal(fixtureDesigner,true);
+ const directory=join(f.root,'a5-isolation'),result=await prepareFailureFamily({...f,directory,seconds:30},{session:async({validate,writableDirectory,prompt,resultSchema})=>{
+  assert(prompt.controlExample.measuredControls.bad.output);
   assert.equal(prompt.target,'a5');assert.equal(prompt.contract.target,'a5');const wire={status:'ready',reason:'Retained source',family:f.family,claims:[{path:'reason',kind:'observation',proofs:[{reference:f.reference}]}]};assert(Check(resultSchema,wire));assert.equal(Check(resultSchema,{...wire,family:{...f.family,target:'a3'}}),false);
   return {value:await submitDraft(validate,writableDirectory,{...wire,files:f.files})};
- }});assert.equal(result.family.target,'a5');await assert.rejects(prepareFailureFamily({...f,directory,seconds:30}),/Isolation inputs changed/);await assert.rejects(prepareFailureFamily({...f,directory,config:{...f.config,target:'a3'},seconds:30}),/Isolation inputs changed/);
+ }});assert.equal(result.family.target,'a5');await assert.rejects(prepareFailureFamily({...f,directory,config:{...f.config,target:'a3'},seconds:30}),/Isolation inputs changed/);
 });
 test('A3 family cannot enter A5 isolation and unsupported targets stop before inference',async t=>{
  const f=await fixture(t);await assert.rejects(loadFailureFamily({file:await f.write(),config:{...f.config,target:'a5'},item:f.item}),/matching A3.A5/);await assert.rejects(prepareFailureFamily({...f,directory:join(f.root,'unsupported'),config:{...f.config,target:'cpu'}},{session:()=>assert.fail('Unsupported target must not invoke model')}),/A3 or A5/);
@@ -490,4 +490,21 @@ test('a retained proposal lets a read-only researcher request the trusted checke
   return reviewSession({...options,config:{...options.config,actor:provider.profile},knowledge:false});
  }});
  assert.equal(checks,1);assert.equal(result.status,'ready');assert.equal(result.family.identity,old.identity);
+});
+
+test('resuming an archived isolation keeps its original identity, elapsed time and native transcript',async t=>{
+ const f=await fixture(t);f.config.target='a5';
+ const directory=join(f.root,'old-isolation');await mkdir(join(directory,'research'),{recursive:true});
+ const source={...f.item,evidence:[]};
+ const identity=sha(JSON.stringify([source.id,source.base,[],f.config.target,'fixture-designer']));
+ await writeFile(join(directory,'research','submission.json'),'original session');
+ await writeFile(join(directory,'isolation.json'),JSON.stringify({identity,elapsedSeconds:7,running:false}));
+ const input={...f,item:source,directory,seconds:30};
+ const result=await prepareFailureFamily(input,{session:async options=>{
+  assert.equal(options.directory,join(directory,'workflow-research'));assert(options.prompt.controlExample);
+  return {value:missingFamily(f.reference)};
+ }});
+ assert.equal(result.identity,identity);assert(result.elapsedSeconds>=7);
+ assert.equal(await readFile(join(directory,'research','submission.json'),'utf8'),'original session');
+ assert.deepEqual(await prepareFailureFamily(input,{session:()=>assert.fail('closed')}),result);
 });

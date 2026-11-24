@@ -15,7 +15,6 @@ const choice=(decision,names)=>{const spec=schema(['decision','reason',...names]
 const designSchema={anyOf:[choice('test',designFields),choice('probe',['code']),choice('withhold',['missing','basis'])]};
 const shape=fileURLToPath(new URL('./fixture-native-shape.py',import.meta.url));
 const route=fileURLToPath(new URL('./fixture-native-route.py',import.meta.url));
-const pinnedDesigner=new URL('./skills/fixture-designer/SKILL.md',import.meta.url);
 function validReason(reason){return typeof reason==='string'&&reason.trim()&&!/^(placeholder|todo|n\/a|unknown)[.!]?$/i.test(reason.trim());}
 async function sdkSourceIdentity(root){
  const entries=[];
@@ -123,14 +122,16 @@ export async function scoreControl({dir,role,design,probe,device,remainingSecond
  return {exit,output};
 }
 
-export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,runtime,signal,seconds=3600},{session,score=scoreControl,now=Date.now,designerSkill=pinnedDesigner,modelIdentity}={}){
- assert(['control','skill','designer'].includes(arm)&&Number.isFinite(seconds)&&seconds>0);
+export async function runFixtureDesign(request,{session,score=scoreControl,now=Date.now,modelIdentity}={}){
+ rejectArchivedAssignment(request);
+ const {config,input,dir,probe,device,sdk,runtime,signal,seconds=3600}=request;
+ assert(Number.isFinite(seconds)&&seconds>0);
  const packet=publicPacket(input);
  const examples=await (await import('../examples/fixture-design/row-sum/packets.mjs')).rowSumHandoffs();
  const profile=config.skill_writer_actor??config.actor;
  const model=await (modelIdentity??(await import('../controller/skill-context.mjs')).skillModelIdentity)(profile);
  const sdkHash=await sdkSourceIdentity(sdk);
- const identity=hash(JSON.stringify([arm,String(device),hash(JSON.stringify(examples)),sdkHash,model,profile?.base_url,packet,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
+ const identity=hash(JSON.stringify(['fixture-design-v1',String(device),hash(JSON.stringify(examples)),sdkHash,model,profile?.base_url,packet,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url)))]));
  await mkdir(dir,{recursive:true});
  const binding=join(dir,'binding.json'),previous=await get(binding);
  if(previous)assert.equal(previous.identity,identity,'replay inputs changed');
@@ -151,7 +152,7 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
   }
   const author=join(path,'fixture.json');let d=await get(author);
   if(!d){
-   const {value}=await session({directory:join(path,'designer'),config,fixtureDesigner:arm!=='control',signal,seconds:(deadline-now())/1000,allowedPaths:[sdk],resultSchema:designSchema,
+   const {value}=await session({directory:join(path,'designer'),config,signal,seconds:(deadline-now())/1000,allowedPaths:[sdk],resultSchema:designSchema,
     prompt:{workedExample:feedback?examples.feedback:examples.designer,task:'Design a bounded device fixture for the observed leaf operation. Use the parent contract for context. Submit test, probe (a small standalone Python question run in the bound runtime), or withhold with a specific missing fact and evidence basis. Supply callable implementations and an independent checker accepting the implementation filename as argv[1]. Vary values, include boundaries and preserved output sentinels where relevant. Select diagnosticRef from records.diagnosticOptions. Bad must launch in the same Python process and trigger AssertionError with the stable checkId followed by colon, space and actual numerical details. Keep the oracle in the checker. The runner executes each control and returns observations.',operation:packet.operation,originalContract:packet.originalContract,records:packet,sdk,feedback},validate:v=>validateDesign(v,packet,feedback)});
    d=validateDesign(value,packet,feedback);await save(author,d);
   }
@@ -200,11 +201,15 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
  return finish({status:'elapsed'});
 }
 
-export async function fixtureReplayRequest(config,request,signal){
+function rejectArchivedAssignment(request){
+ assert(!Object.hasOwn(request,'arm'),'This paired study request belongs to its original frozen runner. Use a fresh output directory and a fixture-design request for a new fixture.');
+}
+export async function fixtureDesignRequest(config,request,signal){
+ rejectArchivedAssignment(request);
  const {withSkillLock}=await import('./evolution-lock.mjs');
  const input=JSON.parse(await text(request.packet));
  publicPacket(input);
  assert(config.target==='a5'&&/^\d+$/.test(String(request.device))&&request.sdk&&request.runtime);
  const dir=resolve(request.output);
- return withSkillLock(config,()=>runFixtureDesign({...request,input,dir,config,signal}),{signal,key:'fixture-replay:'+hash(dir)});
+ return withSkillLock(config,()=>runFixtureDesign({...request,input,dir,config,signal}),{signal,key:'fixture-design:'+hash(dir)});
 }
