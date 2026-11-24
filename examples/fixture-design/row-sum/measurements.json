@@ -9,6 +9,6 @@
   },
   "bad": {
     "exit": 1,
-    "output": "VERIFIED_NATIVE_ROUTE 1 1\nAssertionError: output-values: seed=0 expected=[-9.0, 7.0, 3.0] got=[-11.0, 10.0, -1.0]"
+    "output": "VERIFIED_NATIVE_ROUTE 1 1\nAssertionError: output-values: seed=0 expected=[-9.0, 7.0, 3.0] got=[-11.0, 10.0, -1.0]\nVERIFIED_CHECK_FAILURE {\"id\": \"output-values\", \"details\": \"seed=0 expected=[-9.0, 7.0, 3.0] got=[-11.0, 10.0, -1.0]\"}"
   }
 }
