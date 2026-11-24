@@ -13,11 +13,26 @@ def modules(tree):
             names.add(node.module)
     return names
 checker = ast.parse(v['checker'])
+process_aliases = {}
 for node in ast.walk(checker):
-    if isinstance(node, (ast.Import, ast.ImportFrom)):
-        imports = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or '']
-        if any(name.split('.')[0] in {'subprocess', 'multiprocessing'} for name in imports):
-            sys.exit('checker: execute the submitted implementation in this Python process so its compile and launch are measured. Load sys.argv[1] via runpy.run_path or importlib, invoke its callable, and independently compare returned values.')
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            process_aliases[alias.asname or alias.name] = alias.name
+    if isinstance(node, ast.ImportFrom) and node.module:
+        for alias in node.names:
+            process_aliases[alias.asname or alias.name] = node.module + '.' + alias.name
+launchers = {'subprocess.run', 'subprocess.call', 'subprocess.check_call', 'subprocess.check_output',
+             'subprocess.Popen', 'multiprocessing.Process', 'os.system', 'os.popen'}
+for call in (n for n in ast.walk(checker) if isinstance(n, ast.Call)):
+    fn = call.func
+    if isinstance(fn, ast.Name):
+        name = process_aliases.get(fn.id)
+    elif isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
+        name = process_aliases.get(fn.value.id, fn.value.id) + '.' + fn.attr
+    else:
+        continue
+    if name in launchers:
+        sys.exit('checker: execute the submitted implementation in this Python process so its compile and launch are measured. Load sys.argv[1] via runpy.run_path or importlib, invoke its callable, and independently compare returned values.')
 approved=set()
 for source in witnesses:
     try: approved.update(modules(ast.parse(source)))
