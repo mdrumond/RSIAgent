@@ -534,3 +534,15 @@ permanent comparison fence forces an inconclusive outcome without replay or
 rescoring; its elapsed spend and prior samples remain intact. Live workers,
 qualification and ordinary evaluation do not receive this retirement permission,
 and unknown native work remains blocked until positive closure is established.
+
+### Paired fixture design on A5
+
+Set `skills.failureFirst.fixtureDesigner` to `true` to enable the fixture-designer skill for new A5 failure-first runs. Each run freezes that choice. To compare the skill on archived data without launching candidate actors, invoke one replay assignment:
+
+```sh
+node cli/main.mjs skills-fixture-replay --instance "$INSTANCE" --config "$REQUEST"
+```
+
+The request is a JSON object with `packet` (public packet path), `output` (unique assignment directory), `arm` (`control` or `skill`), `sdk` (installed Catlass Python package directory), `device` (preflighted physical ID), `runtime` (frozen runtime identity), `probe` (trusted execution adapter path) and `seconds` (elapsed allowance). The packet contains four `{reference,text}` records in `records`, named `public-task`, `failing-source`, `observed-output` and `inherited-guidance`. Prompt fields `operation` and `originalContract` are optional public text. Keep held-out and historical evaluator data outside the packet and SDK.
+
+The adapter receives the control directory and physical device ID as positional arguments. It executes the staged `probe.py` in the bound runtime and returns its stdout, stderr and exit status. Use one isolated output per case and arm. Repeating the same assignment resumes completed controls and preserves the original deadline. The terminal `outcome.json` records fixture qualification, withholding or expiration.

@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {publicPacket,validateDesign,checkControls,runFixtureDesign} from '../../cli/fixture-development-replay.mjs';
+import {publicPacket,validateDesign,checkControls,runFixtureDesign,scoreControl} from '../../cli/fixture-development-replay.mjs';
 
 const code='import catlass.tla as tla\ndef run():\n return tla.compile(fn)()';
 const input={records:[['public-task','cover all lanes'],['failing-source',code],['observed-output','error: duplicated index'],['inherited-guidance','historical guidance'],['private-evaluator','secret verifier']].map(([reference,text])=>({reference,text}))};
@@ -36,6 +36,7 @@ test('paired public input stays identical; restore completed scores and apply re
   assert.equal(new Set(launches).size,6);assert.equal(launches.length,6);assert.equal(sessions.length,4);
   assert.equal(sessions[0].fixtureDesigner,arm==='designer');assert.equal(sessions[1].fixtureDesigner,undefined);
   assert.deepEqual(sessions[2].prompt.feedback.review,{verdict:'revise',reason:'protect tail values'});assert.deepEqual(sessions[2].prompt.feedback.previousFixture,design);assert.deepEqual(sessions[2].prompt.feedback.measuredControls.bad,outputs.bad);prompts[arm]=sessions[0].prompt;
+  await assert.rejects(runFixtureDesign({...args,device:1},deps),/inputs changed/);
   await assert.rejects(runFixtureDesign(args,{...deps,modelIdentity:async()=>({model:'two'})}),/inputs changed/);
   await writeFile(join(sdk,'core.py'),'x=2');await assert.rejects(runFixtureDesign(args,deps),/inputs changed/);await writeFile(join(sdk,'core.py'),'x=1');
   await writeFile(skill,'changed bytes');if(arm==='control')assert.equal((await runFixtureDesign(args,deps)).status,'qualified');else await assert.rejects(runFixtureDesign(args,deps),/inputs changed/);
@@ -52,4 +53,13 @@ test('native route keeps oracle failure for incomplete second tile, rejects no l
  const check=limit=>'import catlass.tla as tla,runpy\na=[0]*129\nfill=runpy.run_path("kernel.py")["fill"]\ntla.compile(fill)(a,'+limit+')\nassert a==[1]*129,"tail mismatch"';
  const good=await launch(check(129)),bad=await launch(check(128)),host=await launch('import catlass.tla as tla\nfrom kernel import fill\nfill([0],1)\ntla.compile(lambda: 1)()');
  assert.equal(good.status,0);assert.match(good.stdout,/VERIFIED_NATIVE_ROUTE 1 1/);assert.equal(bad.status,1);assert.match(bad.stderr,/tail mismatch/);assert.equal(host.status,1);assert.match(host.stderr,/no native Catlass launch/);
+});
+
+test('cancellation closes a live native control and its subprocess before returning',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'fixture-cancel-'));t.after(()=>rm(root,{recursive:true,force:true}));
+ const probe=join(root,'runner.sh'),pidFile=join(root,'child.pid');await writeFile(probe,'sleep 60 &\necho $! > "$1/child.pid"\nwait\n');
+ const abort=new AbortController(),pending=scoreControl({dir:root,role:'good',design,probe,device:0,remainingSeconds:30,signal:abort.signal});
+ let pid;for(let i=0;i<100&&!pid;i++){try{pid=Number(await readFile(pidFile,'utf8'));}catch{await new Promise(r=>setTimeout(r,10));}}
+ assert(pid);abort.abort(Error('operator cancelled'));await assert.rejects(pending,/operator cancelled/);
+ try{const stat=await readFile('/proc/'+pid+'/stat','utf8');assert.equal(stat.split(' ')[2],'Z');}catch(e){if(e.code!=='ENOENT')throw e;}
 });

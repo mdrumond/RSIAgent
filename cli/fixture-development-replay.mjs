@@ -3,7 +3,7 @@ import {readFile,writeFile,mkdir,rename,readdir,realpath} from 'node:fs/promises
 import {join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash,randomUUID} from 'node:crypto';
-import {spawnSync} from 'node:child_process';
+import {spawn,spawnSync} from 'node:child_process';
 
 const hash=x=>createHash('sha256').update(x).digest('hex');
 const text=p=>readFile(p,'utf8');
@@ -62,14 +62,25 @@ export function checkControls(design,runs){
   return ok?[]:[{role,exit,output:output.slice(-3000)}];
  });
 }
-export async function scoreControl({dir,role,design,probe,device,remainingSeconds}){
+export async function scoreControl({dir,role,design,probe,device,remainingSeconds,signal}){
  await mkdir(dir,{recursive:true});
  await Promise.all([['kernel.py',design[role]],['check.py',design.checker],['route.py',await text(route)],['probe.py',"import runpy,sys\nsys.argv=['route.py','check.py','kernel.py'];runpy.run_path('route.py',run_name='__main__')\n"]].map(([name,bytes])=>writeFile(join(dir,name),bytes)));
- const p=spawnSync('/bin/bash',[probe,dir,String(device)],{encoding:'utf8',maxBuffer:8*1024*1024,timeout:Math.max(1,Math.ceil(remainingSeconds*1000))});
- if(p.error)throw p.error;
- const output=p.stdout+p.stderr;
- assert(Number.isInteger(p.status)&&output.trim()&&!/sandbox policy unavailable|aclInit, error code is 507899/i.test(output),'control infrastructure error: '+output.slice(-1200));
- return {exit:p.status,output};
+ const clock=AbortSignal.timeout(Math.max(1,Math.ceil(remainingSeconds*1000)));
+ const stop=signal?AbortSignal.any([signal,clock]):clock;stop.throwIfAborted();
+ const child=spawn('/bin/bash',[probe,dir,String(device)],{detached:true,stdio:['ignore','pipe','pipe']});
+ const chunks=[];let bytes=0,overflow=false;
+ const terminate=()=>{if(child.pid)try{process.kill(-child.pid,'SIGKILL');}catch(e){if(e.code!=='ESRCH')throw e;}};
+ const collect=chunk=>{bytes+=chunk.length;if(bytes<=8*1024*1024)chunks.push(chunk);else if(!overflow){overflow=true;terminate();}};
+ child.stdout.on('data',collect);child.stderr.on('data',collect);
+ stop.addEventListener('abort',terminate,{once:true});
+ let exit;
+ try{
+  exit=await new Promise((res,rej)=>{child.once('error',rej);child.once('close',res);});
+ }finally{stop.removeEventListener('abort',terminate);}
+ stop.throwIfAborted();assert(!overflow,'control output exceeded 8 MiB');
+ const output=Buffer.concat(chunks).toString();
+ assert(Number.isInteger(exit)&&output.trim()&&!/sandbox policy unavailable|aclInit, error code is 507899/i.test(output),'control infrastructure error: '+output.slice(-1200));
+ return {exit,output};
 }
 
 export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,runtime,signal,seconds=3600},{session,score=scoreControl,now=Date.now,designerSkill=pinnedDesigner,modelIdentity}={}){
@@ -78,7 +89,7 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
  const profile=config.skill_writer_actor??config.actor;
  const model=await (modelIdentity??(await import('../controller/skill-context.mjs')).skillModelIdentity)(profile);
  const sdkHash=await sdkSourceIdentity(sdk);
- const identity=hash(JSON.stringify([arm,sdkHash,model,profile?.base_url,packet,input.operation,input.originalContract,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
+ const identity=hash(JSON.stringify([arm,String(device),sdkHash,model,profile?.base_url,packet,input.operation,input.originalContract,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
  await mkdir(dir,{recursive:true});
  const binding=join(dir,'binding.json'),previous=await get(binding);
  if(previous)assert.equal(previous.identity,identity,'replay inputs changed');
