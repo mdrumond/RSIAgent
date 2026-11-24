@@ -245,7 +245,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
     const checked=await adapter.checkReferences({family,...(writing?{focused:true}:{}),directory:join(cp.directory,'submission-checks',randomUUID()),
      cacheScope:familyDirectory,seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
     if(writing){
-     const review=await ops.testReview({writing,family,directory:join(cp.directory,'test-reviews',family.identity),config:knowledgeConfig,
+     const review=await ops.testReview({writing,family,measurements:checked.diagnostics,directory:join(cp.directory,'test-reviews',family.identity),config:knowledgeConfig,
       seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
      if(review.verdict!=='approved')throw Object.assign(Error(review.field+' '+JSON.stringify(review.quote)+': '+review.defect),{code:'FAILURE_REFERENCE_REJECTED',diagnostics:checked.diagnostics});
      await writeFile(join(cp.directory,'test-approved.json'),JSON.stringify({family:family.identity,writing:writing.candidate.qa.approval,review}));

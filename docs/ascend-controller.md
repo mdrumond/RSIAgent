@@ -534,3 +534,19 @@ permanent comparison fence forces an inconclusive outcome without replay or
 rescoring; its elapsed spend and prior samples remain intact. Live workers,
 qualification and ordinary evaluation do not receive this retirement permission,
 and unknown native work remains blocked until positive closure is established.
+
+### Fixture design on A5
+
+The A5 campaign uses measured controls and worked examples during fixture design. To design an individual fixture for an archived failure, use the normal skill command:
+
+```sh
+node cli/main.mjs skill --instance "$INSTANCE" --config "$REQUEST"
+```
+
+The request is a JSON object with `action: "fixture-design"`, `packet` (public packet path), `output` (unique assignment directory), `sdk` (installed Catlass Python package directory), `device` (preflighted physical ID), `runtime` (frozen runtime identity), `probe` (trusted execution adapter path) and `seconds` (elapsed allowance). The packet contains four `{reference,text}` records in `records`, named `public-task`, `failing-source`, `observed-output` and `inherited-guidance`. The packet must also contain a nonempty bounded `operation` and the exact original public task in `originalContract` (legacy alias `publicTask`). The contract must match the archived `public-task` record. Keep held-out and historical evaluator data outside the packet and SDK.
+
+The adapter receives the control directory and physical device ID as positional arguments. It executes the staged `probe.py` in the bound runtime and returns its stdout, stderr and exit status. Use one isolated output per fixture. Repeating the same assignment resumes completed controls and preserves the original deadline. The terminal `outcome.json` records fixture qualification, withholding or expiration.
+
+Fixture authors select the archived failure using a line reference such as `observed-output:L7` from the supplied catalog. Numerical checkers use a stable `checkId` and emit measured details after it, for example `AssertionError: output-values: 29 incorrect lanes`. The runner checks the stable ID and evidence of a native launch. A designer can submit a standalone development probe and receive its measured output or cite a specific gap for withholding. Independent QA can return that decision for revision if the evidence already exists.
+
+The row-sum example in `examples/fixture-design/row-sum/` supplies the public design, revision and independent-review examples. Completed role results are reused when the role's implementation and checker bytes match under the frozen runtime and inputs. A changed checker reruns all three roles.

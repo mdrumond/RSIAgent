@@ -35,6 +35,7 @@ export async function copyVersion(config,map,edit) {
   return version;
 }
 export async function run(config,action,options={}) {
+  if(action.action==='fixture-design')return (await import('./fixture-design.mjs')).fixtureDesignRequest(config,action,options.signal);
   if(config.storage&&!options.serialized) {
     const {withSkillLock}=await import('./evolution-lock.mjs');
     return withSkillLock(config,()=>run(config,action,{serialized:true}));

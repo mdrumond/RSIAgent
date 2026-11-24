@@ -138,7 +138,7 @@ export async function main(argv=process.argv.slice(2),{signal,failureDependencie
   }
   if(command==='skill') {
     const action=JSON.parse(await readFile(values.config,'utf8'));
-    return (await import('./skill-input.mjs')).run(config,action);
+    return (await import('./skill-input.mjs')).run(config,action,{signal});
   }
   if(command==='project') {
     if(!values.project) return config.projects;

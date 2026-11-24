@@ -367,10 +367,10 @@ test('scoped campaign repairs immutable writing and test independently before ma
     return {status:'ready',family:submitted};
    },
    testReview:args=>reviewScopedTest(args,request=>reviewScopedArtifact(request,async model=>{
-    const {fields}=model.prompt;assert.equal(fields['development.checker'],'pass');assert.equal(fields['stride.changeType'],'layout');assert(fields['development.controls']);assert.deepEqual(model.evidenceGroups,groups);events.push(['test-review',fields['development.prompt']]);
+    const {fields}=model.prompt;assert.equal(JSON.parse(fields.measuredControls)[0].variant,'starter');assert.equal(fields['development.checker'],'pass');assert.equal(fields['stride.changeType'],'layout');assert(fields['development.controls']);assert.deepEqual(model.evidenceGroups,groups);events.push(['test-review',fields['development.prompt']]);
     return {value:model.validate(JSON.parse(fields['development.controlCaseIds']).includes('large')?{verdict:'revise',field:'development.controlCaseIds',quote:'large',defect:'The wrong control designation ignores the input.'}:{verdict:'approved'})};
    })),
-   runtime:async()=>({...await f.ops.runtime(),checkReferences:async()=>({diagnostics:[]}),qualify:async()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true}),
+   runtime:async()=>({...await f.ops.runtime(),checkReferences:async()=>({diagnostics:[{variant:'starter',mechanismMatch:true}]}),qualify:async()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true}),
     trial:async input=>{events.push(['trial',input.arm]);if(input.arm!=='baseline')assert(input.guidance.includes(approved));
      const value=result(input.arm!=='baseline'||baseline==='pass');value.mechanismMatch=!value.correct&&baseline==='reproduced';return value;}}),
    publish:async args=>(await import('../../cli/skill-failure-candidates.mjs')).publishFailureWinner(args,{publish:async()=>true}),
