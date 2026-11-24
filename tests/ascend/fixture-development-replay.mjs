@@ -115,3 +115,10 @@ test('submitted exceptions cannot impersonate an oracle assertion',async t=>{
  assert.equal(run.status,1);assert.match(run.stdout,/VERIFIED_NATIVE_ROUTE/);assert.doesNotMatch(run.stdout,/VERIFIED_CHECK_FAILURE/);
  assert.equal(checkControls(design,{...outputs,bad:{exit:1,output:run.stdout+run.stderr}},publicPacket(input))[0].role,'bad');
 });
+
+test('packaged row-sum handoffs obey real replay admission and independently measured calibration',()=>{
+ const example=fileURLToPath(new URL('../../examples/fixture-design/row-sum/validate.mjs',import.meta.url));
+ const consumer=fileURLToPath(new URL('../../cli/fixture-development-replay.mjs',import.meta.url));
+ const checked=spawnSync(process.execPath,[example,consumer],{encoding:'utf8'});
+ assert.equal(checked.status,0,checked.stderr);
+});
