@@ -49,17 +49,22 @@ tla.compile = compile_spy
 sys.argv = [check, source]
 try:
     runpy.run_path(check, run_name="__main__")
-except BaseException as failure:
-    if not (isinstance(failure, SystemExit) and failure.code in (None, 0)):
-        trace = failure.__traceback__
-        while trace and trace.tb_next:
-            trace = trace.tb_next
-        if isinstance(failure, AssertionError) and trace and Path(trace.tb_frame.f_code.co_filename).resolve() == Path(check).resolve():
-            check_id, separator, details = str(failure).partition(": ")
-            if separator and details.strip():
-                print("VERIFIED_CHECK_FAILURE", json.dumps({"id": check_id, "details": details}), flush=True)
+except SystemExit as exit_status:
+    if exit_status.code not in (None, 0):
         if all(counts):
             print("VERIFIED_NATIVE_ROUTE", *counts, flush=True)
         raise
+    # A successful CLI exit must pass the same route check as a normal return.
+except BaseException as failure:
+    trace = failure.__traceback__
+    while trace and trace.tb_next:
+        trace = trace.tb_next
+    if isinstance(failure, AssertionError) and trace and Path(trace.tb_frame.f_code.co_filename).resolve() == Path(check).resolve():
+        check_id, separator, details = str(failure).partition(": ")
+        if separator and details.strip():
+            print("VERIFIED_CHECK_FAILURE", json.dumps({"id": check_id, "details": details}), flush=True)
+    if all(counts):
+        print("VERIFIED_NATIVE_ROUTE", *counts, flush=True)
+    raise
 assert all(counts), f"no native Catlass launch of submitted source: {counts}"
 print("VERIFIED_NATIVE_ROUTE", *counts)

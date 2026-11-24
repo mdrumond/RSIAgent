@@ -53,6 +53,11 @@ test('native route keeps oracle failure for incomplete second tile, rejects no l
  await writeFile(join(root,'kernel.py'),'def fill(a,n):\n for i in range(n): a[i]=1\n');
  const check=limit=>'import catlass.tla as tla,runpy\na=[0]*129\nfill=runpy.run_path("kernel.py")["fill"]\ntla.compile(fill)(a,'+limit+')\nassert a==[1]*129,"output-values: tail mismatch"';
  const good=await launch(check(129)),bad=await launch(check(128)),host=await launch('import catlass.tla as tla\nfrom kernel import fill\nfill([0],1)\ntla.compile(lambda: 1)()');
+ for(const ending of ['raise SystemExit(0)','raise SystemExit()']){
+  const cli=await launch(check(129)+'\n'+ending),empty=await launch(ending);
+  assert.equal(cli.status,0);assert.match(cli.stdout,/VERIFIED_NATIVE_ROUTE 1 1/);
+  assert.notEqual(empty.status,0);assert.match(empty.stderr,/no native Catlass launch/);
+ }
  assert.equal(good.status,0);assert.match(good.stdout,/VERIFIED_NATIVE_ROUTE 1 1/);assert.equal(bad.status,1);assert.match(bad.stderr,/tail mismatch/);assert.match(bad.stdout,/VERIFIED_CHECK_FAILURE .*output-values/);assert.equal(host.status,1);assert.match(host.stderr,/no native Catlass launch/);
 });
 
@@ -89,6 +94,7 @@ test('withhold dispute can obtain an actual probe observation and reach an indep
  const result=await runFixtureDesign(args,{modelIdentity:async()=>({model:'mock'}),session:async o=>{
   assert(!JSON.stringify(o.prompt).includes('secret verifier'));
   if(o.directory.endsWith('/withhold-review')){
+   assert.deepEqual(o.validate(o.prompt.workedExample.accepted),o.prompt.workedExample.accepted);assert.throws(()=>o.validate(o.prompt.workedExample.rejected));
    reviews++;return {value:o.validate({verdict:reviews===1?'revise':'withhold',reference:reviews===1?'observed-output:L1':'probe',reason:reviews===1?'inspect the public argument count':'probe shows the binding is unavailable'})};
   }
   turns++;if(turns===2){assert.equal(o.prompt.feedback.review.verdict,'revise');return {value:o.validate({decision:'probe',reason:'measure argument count',code:"print('observed count=2')"})};}
