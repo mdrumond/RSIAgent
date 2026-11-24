@@ -29,6 +29,7 @@
     "web",
     "templates/skills",
     "examples/ascend-targets",
+    "examples/fixture-design",
     "docs/ascend-controller.md",
     "pyproject.toml",
     "npm-shrinkwrap.json",
