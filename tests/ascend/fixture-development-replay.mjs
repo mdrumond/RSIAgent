@@ -31,7 +31,7 @@ test('paired public input stays identical; restore completed scores and apply re
   assert.equal((await runFixtureDesign(args,deps)).status,'qualified');
   assert.equal(new Set(launches).size,6);assert.equal(launches.length,6);assert.equal(sessions.length,4);
   assert.equal(sessions[0].fixtureDesigner,arm==='designer');assert.equal(sessions[1].fixtureDesigner,undefined);
-  assert.deepEqual(sessions[2].prompt.feedback,{verdict:'revise',reason:'protect tail values'});prompts[arm]=sessions[0].prompt;
+  assert.deepEqual(sessions[2].prompt.feedback.review,{verdict:'revise',reason:'protect tail values'});assert.deepEqual(sessions[2].prompt.feedback.previousFixture,design);assert.deepEqual(sessions[2].prompt.feedback.measuredControls.bad,outputs.bad);prompts[arm]=sessions[0].prompt;
  }
  assert.deepEqual(prompts.control,prompts.designer);
 });

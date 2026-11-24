@@ -85,13 +85,14 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
     runs[role]=await score({dir:where,role,design:d,probe,device,signal,remainingSeconds:(deadline-now())/1000});await save(stored,runs[role]);
    }
   }
-  feedback=checkControls(d,runs);
-  if(!feedback.length){
+  const failures=checkControls(d,runs);
+  feedback={previousFixture:d,measuredControls:Object.fromEntries(Object.entries(runs).map(([role,r])=>[role,{exit:r.exit,output:r.output.slice(-3000)}])),failures};
+  if(!failures.length){
    if(now()>=deadline)return finish({status:'elapsed',round});
    const {value}=await session({directory:join(path,'independent-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason']),
     prompt:{task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Give a specific correction or withhold if unsupported.',operation:input.operation,records:packet,fixture:d,measurements:runs},validate:v=>{assert(['approve','revise','withhold'].includes(v.verdict)&&v.reason?.trim());return v;}});
    if(value.verdict!=='revise')return finish({status:value.verdict==='approve'?'qualified':'withheld',round,reason:value.reason});
-   feedback=value;
+   feedback.review=value;
   }
   await save(join(path,'feedback.json'),feedback);
  }
