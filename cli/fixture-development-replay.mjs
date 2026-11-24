@@ -97,6 +97,10 @@ export function assessControls(design,runs,packet){
 export function checkControls(design,runs,packet){
  return Object.entries(assessControls(design,runs,packet)).filter(([,v])=>!v.matched).map(([role,v])=>({role,...v}));
 }
+export function validateFixtureReview(review,design){
+ assert(['approve','revise','withhold'].includes(review.verdict)&&validReason(review.reason),'submit a verdict with a specific reason');
+ assert([...roles,'checker',design.diagnosticRef].includes(review.reference),'cite a scored role, checker or selected diagnostic');return review;
+}
 export async function scoreControl({dir,role,design,probe,device,remainingSeconds,signal}){
  await mkdir(dir,{recursive:true});
  if(role==='probe')await writeFile(join(dir,'probe.py'),design.code);
@@ -182,7 +186,7 @@ export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,ru
   if(!failures.length){
    if(now()>=deadline)return finish({status:'elapsed',round});
    const {value}=await session({directory:join(path,'independent-review'),config,signal,seconds:(deadline-now())/1000,resultSchema:schema(['verdict','reason','reference']),
-    prompt:{workedExample:examples.reviewer,task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Cite the role (starter/good/bad), checker or archived diagnostic reference supporting your decision. Give a specific correction or withhold if unsupported.',operation:packet.operation,records:packet,fixture:d,measurements:feedback.assessment},validate:v=>{assert(['approve','revise','withhold'].includes(v.verdict)&&validReason(v.reason));assert([...roles,'checker',d.diagnosticRef].includes(v.reference),'cite a scored role, checker or selected diagnostic');return v;}});
+    prompt:{workedExample:examples.reviewer,task:'Approve only if this bounds the witnessed operation, exercises native behavior and independently checks actual values, tails and untouched output as applicable. Inspect code and measured controls. Cite the role (starter/good/bad), checker or archived diagnostic reference supporting your decision. Give a specific correction or withhold if unsupported.',operation:packet.operation,records:packet,fixture:d,measurements:feedback.assessment},validate:v=>validateFixtureReview(v,d)});
    if(value.verdict!=='revise')return finish({status:value.verdict==='approve'?'qualified':'withheld',round,reason:value.reason});
    feedback.review=value;
   }
