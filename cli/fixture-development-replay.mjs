@@ -13,6 +13,7 @@ const schema=names=>({type:'object',properties:Object.fromEntries(names.map(k=>[
 const designSchema=schema(['decision','reason','prompt','starter','good','bad','checker','diagnostic','mathFailure']);
 const shape=fileURLToPath(new URL('./fixture-native-shape.py',import.meta.url));
 const route=fileURLToPath(new URL('./fixture-native-route.py',import.meta.url));
+const pinnedDesigner=new URL('./skills/fixture-designer/SKILL.md',import.meta.url);
 const fields=['public-task','failing-source','observed-output','inherited-guidance'];
 
 export function publicPacket(input){
@@ -51,10 +52,10 @@ export async function scoreControl({dir,role,design,probe,device,remainingSecond
  return {exit:p.status,output};
 }
 
-export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,runtime,signal,seconds=3600},{session,score=scoreControl,now=Date.now}={}){
+export async function runFixtureDesign({config,input,arm,dir,probe,device,sdk,runtime,signal,seconds=3600},{session,score=scoreControl,now=Date.now,designerSkill=pinnedDesigner}={}){
  assert(['control','skill','designer'].includes(arm)&&Number.isFinite(seconds)&&seconds>0);
  const packet=publicPacket(input);
- const identity=hash(JSON.stringify([arm,packet,input.operation,input.originalContract,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape))]));
+ const identity=hash(JSON.stringify([arm,packet,input.operation,input.originalContract,runtime,seconds,hash(await text(probe)),hash(await text(route)),hash(await text(shape)),hash(await text(new URL(import.meta.url))),arm==='control'?null:hash(await text(designerSkill))]));
  await mkdir(dir,{recursive:true});
  const binding=join(dir,'binding.json'),previous=await get(binding);
  if(previous)assert.equal(previous.identity,identity,'replay inputs changed');

@@ -22,7 +22,8 @@ test('paired public input stays identical; restore completed scores and apply re
  for(const arm of ['control','designer']){
   const launches=[],sessions=[];let interrupted=false;
   const args={config:{},input,arm,dir:join(root,arm),probe,device:0,sdk:root,runtime:'test',seconds:20};
-  const deps={score:async({role,dir})=>{if(role==='good'&&!interrupted){interrupted=true;throw Error('infrastructure');}launches.push(dir);return outputs[role];},
+  const skill=join(root,arm+'-skill.md');await writeFile(skill,'skill bytes');
+  const deps={designerSkill:skill,score:async({role,dir})=>{if(role==='good'&&!interrupted){interrupted=true;throw Error('infrastructure');}launches.push(dir);return outputs[role];},
    session:async args=>{assert(!JSON.stringify(args.prompt).includes('secret verifier'));sessions.push(args);
     if(args.directory.endsWith('/designer'))return {value:args.validate(design)};
     return {value:args.validate({verdict:sessions.length===2?'revise':'approve',reason:'protect tail values'})};}};
@@ -32,12 +33,13 @@ test('paired public input stays identical; restore completed scores and apply re
   assert.equal(new Set(launches).size,6);assert.equal(launches.length,6);assert.equal(sessions.length,4);
   assert.equal(sessions[0].fixtureDesigner,arm==='designer');assert.equal(sessions[1].fixtureDesigner,undefined);
   assert.deepEqual(sessions[2].prompt.feedback.review,{verdict:'revise',reason:'protect tail values'});assert.deepEqual(sessions[2].prompt.feedback.previousFixture,design);assert.deepEqual(sessions[2].prompt.feedback.measuredControls.bad,outputs.bad);prompts[arm]=sessions[0].prompt;
+  await writeFile(skill,'changed bytes');if(arm==='control')assert.equal((await runFixtureDesign(args,deps)).status,'qualified');else await assert.rejects(runFixtureDesign(args,deps),/inputs changed/);
  }
  assert.deepEqual(prompts.control,prompts.designer);
 });
 test('native route keeps oracle failure for incomplete second tile, rejects no launch',async t=>{
  const root=await mkdtemp(join(tmpdir(),'fixture-route-'));t.after(()=>rm(root,{recursive:true,force:true}));
- const {mkdir}=await import('node:fs/promises');await mkdir(join(root,'catlass'));
+ const {mkdir}=await import('node:fs/promises');await mkdir(join(root,'catlass'));await writeFile(join(root,'catlass','__init__.py'),'');
  await writeFile(join(root,'catlass','tla.py'),'def compile(fn): return fn\n');
  const route=fileURLToPath(new URL('../../cli/fixture-native-route.py',import.meta.url));
  const launch=async body=>{await writeFile(join(root,'checker.py'),body);return spawnSync('python3',[route,'checker.py','kernel.py'],{cwd:root,env:{...process.env,PYTHONPATH:root},encoding:'utf8'});};
